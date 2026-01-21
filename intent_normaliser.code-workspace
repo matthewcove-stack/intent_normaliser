@@ -1,0 +1,21 @@
+{
+  "folders": [
+    {
+      "path": "."
+    },
+    {
+      "path": "notion_ai"
+    },
+    {
+      "path": "chat_to_notion_runner"
+    }
+  ],
+  "settings": {},
+  "extensions": {
+    "recommendations": [
+      "ms-python.python",
+      "ms-python.vscode-pylance",
+      "ms-azuretools.vscode-docker"
+    ]
+  }
+}

@@ -2,6 +2,10 @@
 
 Phase 0 skeleton for the Intent Normaliser Service. This includes a FastAPI app, mandatory Postgres persistence (append-only), Alembic migrations, and Docker-first development.
 
+## Workspace
+
+Open `intent_normaliser.code-workspace` in VS Code to load this repo plus the related `notion_ai` and `chat_to_notion_runner` repos. Keep those folders next to this one so the relative paths resolve on each machine.
+
 ## Quickstart (Docker)
 
 Build and start Postgres, run migrations, and start the API:
