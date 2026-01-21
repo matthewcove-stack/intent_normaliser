@@ -125,7 +125,11 @@ def normalize_intent(
                 status="needs_clarification",
                 canonical_draft=canonical_draft,
                 clarification=ClarificationPayload(
-                    question=f"Which project matches '{project_value}'?",
+                    question=(
+                        f"Which project matches '{project_value}'?"
+                        if candidates
+                        else f"Provide the project id for '{project_value}'."
+                    ),
                     expected_answer_type=expected_type,
                     candidates=candidates,
                 ),
@@ -191,7 +195,8 @@ def apply_clarification_answer(
             fields["project_id"] = choice_id
             fields.pop("project", None)
         elif answer_text:
-            fields["project"] = answer_text
+            fields["project_id"] = answer_text
+            fields.pop("project", None)
     elif field == "due":
         if answer_text:
             fields["due"] = answer_text

@@ -98,7 +98,10 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             "artifact_hash": sha256_hex(canonical_json(artifact)),
             "artifact": artifact,
         }
-        insert_intent_artifact(app.state.engine, artifact_payload)
+        try:
+            insert_intent_artifact(app.state.engine, artifact_payload)
+        except SQLAlchemyError:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unavailable")
 
     def compute_idempotency_key(packet: Dict[str, Any]) -> str:
         conversation_id = packet.get("conversation_id")
