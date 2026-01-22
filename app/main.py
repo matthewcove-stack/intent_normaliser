@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
@@ -27,6 +27,7 @@ from app.storage.db import (
     check_db,
     create_clarification,
     create_db_engine,
+    expire_clarification,
     get_clarification,
     get_intent,
     get_open_clarification_for_intent,
@@ -153,6 +154,8 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             expected_answer_type=row["expected_answer_type"],
             candidates=row.get("candidates") or [],
             status=row["status"],
+            answer=row.get("answer"),
+            answered_at=row.get("answered_at").isoformat() if row.get("answered_at") else None,
         )
 
     def outcome_response_from_intent(
@@ -216,13 +219,17 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         response: Response,
         _: None = Depends(require_bearer),
         settings: Settings = Depends(get_settings),
+        x_actor_id: str | None = Header(default=None, alias="X-Actor-Id"),
     ) -> IngestResponse:
         packet_data = packet.model_dump(mode="json", exclude_none=True)
         idempotency_key = compute_idempotency_key(packet_data)
         intent_id = packet.intent_id or new_intent_id()
         correlation_id = packet.correlation_id or new_correlation_id()
+        actor_id = x_actor_id or packet_data.get("actor_id")
         packet_data["intent_id"] = intent_id
         packet_data["correlation_id"] = correlation_id
+        if actor_id:
+            packet_data["actor_id"] = actor_id
 
         try:
             intent_row, created = upsert_intent_by_idempotency_key(
@@ -232,6 +239,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 status="received",
                 raw_packet=packet_data,
                 correlation_id=correlation_id,
+                actor_id=actor_id,
             )
         except SQLAlchemyError:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unavailable")
@@ -262,7 +270,12 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         if not created:
             clarification_row = None
             if intent_row["status"] == "needs_clarification":
-                clarification_row = get_open_clarification_for_intent(app.state.engine, intent_id)
+                clarification_row = get_open_clarification_for_intent(
+                    app.state.engine,
+                    intent_id,
+                    actor_id=actor_id,
+                    expiry_hours=settings.clarification_expiry_hours,
+                )
             response_payload = outcome_response_from_intent(intent_row, clarification_row)
             try:
                 persist_artifact(
@@ -297,12 +310,14 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 question=result.clarification.question if result.clarification else "Clarification required",
                 expected_answer_type=result.clarification.expected_answer_type if result.clarification else "free_text",
                 candidates=result.clarification.candidates if result.clarification else [],
+                actor_id=actor_id,
             )
             intent_row = update_intent(
                 app.state.engine,
                 intent_id=intent_id,
                 status="needs_clarification",
                 canonical_draft=result.canonical_draft or {},
+                actor_id=actor_id,
             )
             clarification_payload = build_clarification_payload(clarification_row)
             response_payload = IngestResponse(
@@ -444,10 +459,16 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
     def list_clarifications(
         status: str = "open",
         _: None = Depends(require_bearer),
+        settings: Settings = Depends(get_settings),
+        x_actor_id: str | None = Header(default=None, alias="X-Actor-Id"),
     ) -> List[Clarification]:
         if status != "open":
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported status filter")
-        rows = list_open_clarifications(app.state.engine)
+        rows = list_open_clarifications(
+            app.state.engine,
+            actor_id=x_actor_id,
+            expiry_hours=settings.clarification_expiry_hours,
+        )
         return [build_clarification_payload(row) for row in rows]
 
     @app.post("/v1/clarifications/{clarification_id}/answer", response_model=IngestResponse)
@@ -456,13 +477,39 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         payload: ClarificationAnswerRequest,
         _: None = Depends(require_bearer),
         settings: Settings = Depends(get_settings),
+        x_actor_id: str | None = Header(default=None, alias="X-Actor-Id"),
     ) -> IngestResponse:
         if not payload.choice_id and not payload.answer_text:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Answer payload required")
         clarification = get_clarification(app.state.engine, clarification_id)
         if not clarification:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Clarification not found")
+        if x_actor_id and clarification.get("actor_id") and clarification.get("actor_id") != x_actor_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Clarification not found")
+        if clarification["status"] == "open":
+            created_at = clarification.get("created_at")
+            if created_at:
+                cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.clarification_expiry_hours)
+                if created_at < cutoff:
+                    expire_clarification(app.state.engine, clarification_id=clarification_id)
+                    update_intent(app.state.engine, intent_id=clarification["intent_id"], status="expired")
+                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Clarification expired")
         if clarification["status"] != "open":
+            if clarification["status"] == "answered":
+                stored_answer = clarification.get("answer") or {}
+                if stored_answer == payload.model_dump(mode="json", exclude_none=True):
+                    intent_row = get_intent(app.state.engine, clarification["intent_id"])
+                    if not intent_row:
+                        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Intent not found")
+                    clarification_row = None
+                    if intent_row["status"] == "needs_clarification":
+                        clarification_row = get_open_clarification_for_intent(
+                            app.state.engine,
+                            intent_row["intent_id"],
+                            actor_id=x_actor_id,
+                            expiry_hours=settings.clarification_expiry_hours,
+                        )
+                    return outcome_response_from_intent(intent_row, clarification_row)
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Clarification already answered")
 
         answer_payload = payload.model_dump(mode="json", exclude_none=True)
@@ -518,12 +565,14 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 question=result.clarification.question if result.clarification else "Clarification required",
                 expected_answer_type=result.clarification.expected_answer_type if result.clarification else "free_text",
                 candidates=result.clarification.candidates if result.clarification else [],
+                actor_id=intent_row.get("actor_id"),
             )
             intent_row = update_intent(
                 app.state.engine,
                 intent_id=intent_row["intent_id"],
                 status="needs_clarification",
                 canonical_draft=result.canonical_draft or updated_packet,
+                actor_id=intent_row.get("actor_id"),
             )
             clarification_payload = build_clarification_payload(clarification_row)
             response_payload = IngestResponse(
@@ -607,13 +656,22 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
     def get_intent_endpoint(
         intent_id: str,
         _: None = Depends(require_bearer),
+        settings: Settings = Depends(get_settings),
+        x_actor_id: str | None = Header(default=None, alias="X-Actor-Id"),
     ) -> IngestResponse:
         intent_row = get_intent(app.state.engine, intent_id)
         if not intent_row:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Intent not found")
+        if x_actor_id and intent_row.get("actor_id") and intent_row.get("actor_id") != x_actor_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Intent not found")
         clarification_row = None
         if intent_row["status"] == "needs_clarification":
-            clarification_row = get_open_clarification_for_intent(app.state.engine, intent_id)
+            clarification_row = get_open_clarification_for_intent(
+                app.state.engine,
+                intent_id,
+                actor_id=x_actor_id,
+                expiry_hours=settings.clarification_expiry_hours,
+            )
         return outcome_response_from_intent(intent_row, clarification_row)
 
     return app

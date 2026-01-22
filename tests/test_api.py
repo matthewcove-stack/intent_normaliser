@@ -193,6 +193,71 @@ def test_idempotent_repost_returns_same_intent() -> None:
     assert clarifications == 1
 
 
+def test_idempotent_clarification_answer_returns_ready() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "intent_type": "create_task",
+        "fields": {"title": "Ship this", "project": "John and Sagita"},
+    }
+    response = client.post("/v1/intents", json=payload, headers=headers)
+    clarification_id = response.json()["clarification"]["clarification_id"]
+
+    answer_payload = {"choice_id": "proj_123"}
+    first = client.post(
+        f"/v1/clarifications/{clarification_id}/answer",
+        json=answer_payload,
+        headers=headers,
+    )
+    assert first.status_code == 200
+    assert first.json()["status"] == "ready"
+
+    second = client.post(
+        f"/v1/clarifications/{clarification_id}/answer",
+        json=answer_payload,
+        headers=headers,
+    )
+    assert second.status_code == 200
+    assert second.json()["status"] == "ready"
+
+
+def test_expired_clarification_is_removed() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "intent_type": "create_task",
+        "fields": {"title": "Old task", "project": "John and Sagita"},
+    }
+    response = client.post("/v1/intents", json=payload, headers=headers)
+    intent_id = response.json()["intent_id"]
+
+    engine = sa.create_engine(settings.database_url, future=True)
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE clarifications SET created_at = now() - interval '200 hours' WHERE intent_id = :intent_id"),
+            {"intent_id": intent_id},
+        )
+
+    list_response = client.get("/v1/clarifications", headers=headers)
+    assert list_response.status_code == 200
+    assert list_response.json() == []
+
+    with engine.connect() as conn:
+        status_value = conn.execute(
+            sa.text("SELECT status FROM intents WHERE intent_id = :intent_id"),
+            {"intent_id": intent_id},
+        ).scalar_one()
+    assert status_value == "expired"
+
+
 def test_low_confidence_rejected() -> None:
     settings = build_settings()
     app = create_app(settings)

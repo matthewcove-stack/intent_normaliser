@@ -14,12 +14,14 @@ intents = Table(
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("status", Text, nullable=False),
     Column("idempotency_key", Text, nullable=False, unique=True),
+    Column("actor_id", Text, nullable=True),
     Column("raw_packet", JSONB, nullable=False),
     Column("canonical_draft", JSONB, nullable=True),
     Column("final_canonical", JSONB, nullable=True),
     Column("correlation_id", Text, nullable=False),
     Index("ix_intents_status", "status"),
     Index("ix_intents_idempotency_key", "idempotency_key"),
+    Index("ix_intents_actor_id", "actor_id"),
 )
 
 clarifications = Table(
@@ -34,8 +36,10 @@ clarifications = Table(
     Column("candidates", JSONB, nullable=False, server_default=text("'[]'::jsonb")),
     Column("answer", JSONB, nullable=True),
     Column("answered_at", DateTime(timezone=True), nullable=True),
+    Column("actor_id", Text, nullable=True),
     Index("ix_clarifications_status", "status"),
     Index("ix_clarifications_intent_id", "intent_id"),
+    Index("ix_clarifications_actor_id", "actor_id"),
 )
 
 intent_artifacts = Table(

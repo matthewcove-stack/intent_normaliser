@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from sqlalchemy import Engine, create_engine, select, text, update
@@ -26,6 +27,7 @@ def upsert_intent_by_idempotency_key(
     status: str,
     raw_packet: Dict[str, Any],
     correlation_id: str,
+    actor_id: Optional[str] = None,
     canonical_draft: Optional[Dict[str, Any]] = None,
     final_canonical: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], bool]:
@@ -35,6 +37,7 @@ def upsert_intent_by_idempotency_key(
             intent_id=intent_id,
             status=status,
             idempotency_key=idempotency_key,
+            actor_id=actor_id,
             raw_packet=raw_packet,
             canonical_draft=canonical_draft,
             final_canonical=final_canonical,
@@ -52,7 +55,10 @@ def upsert_intent_by_idempotency_key(
         ).mappings().first()
         if not existing:
             raise SQLAlchemyError("Idempotency upsert failed to return a row")
-        return dict(existing), False
+        existing_dict = dict(existing)
+        if actor_id and not existing_dict.get("actor_id"):
+            existing_dict = update_intent(engine, intent_id=existing_dict["intent_id"], actor_id=actor_id)
+        return existing_dict, False
 
 
 def update_intent(
@@ -63,6 +69,7 @@ def update_intent(
     canonical_draft: Optional[Dict[str, Any]] = None,
     final_canonical: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
+    actor_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     values: Dict[str, Any] = {"updated_at": text("now()")}
     if status is not None:
@@ -73,6 +80,8 @@ def update_intent(
         values["final_canonical"] = final_canonical
     if correlation_id is not None:
         values["correlation_id"] = correlation_id
+    if actor_id is not None:
+        values["actor_id"] = actor_id
     stmt = (
         update(intents)
         .where(intents.c.intent_id == intent_id)
@@ -101,6 +110,7 @@ def create_clarification(
     expected_answer_type: str,
     candidates: Iterable[Dict[str, Any]],
     answer: Optional[Dict[str, Any]] = None,
+    actor_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     stmt = (
         clarifications.insert()
@@ -111,6 +121,7 @@ def create_clarification(
             expected_answer_type=expected_answer_type,
             candidates=list(candidates),
             answer=answer,
+            actor_id=actor_id,
         )
         .returning(*clarifications.c)
     )
@@ -129,23 +140,41 @@ def get_clarification(engine: Engine, clarification_id: str) -> Optional[Dict[st
         return dict(row) if row else None
 
 
-def get_open_clarification_for_intent(engine: Engine, intent_id: str) -> Optional[Dict[str, Any]]:
+def get_open_clarification_for_intent(
+    engine: Engine,
+    intent_id: str,
+    *,
+    actor_id: Optional[str] = None,
+    expiry_hours: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    if expiry_hours is not None:
+        expire_open_clarifications(engine, expiry_hours, intent_id=intent_id, actor_id=actor_id)
+    stmt = select(clarifications).where(
+        clarifications.c.intent_id == intent_id,
+        clarifications.c.status == "open",
+    )
+    if actor_id:
+        stmt = stmt.where(clarifications.c.actor_id == actor_id)
+    stmt = stmt.order_by(clarifications.c.created_at.desc())
     with engine.begin() as conn:
-        row = conn.execute(
-            select(clarifications)
-            .where(clarifications.c.intent_id == intent_id, clarifications.c.status == "open")
-            .order_by(clarifications.c.created_at.desc())
-        ).mappings().first()
+        row = conn.execute(stmt).mappings().first()
         return dict(row) if row else None
 
 
-def list_open_clarifications(engine: Engine) -> list[Dict[str, Any]]:
+def list_open_clarifications(
+    engine: Engine,
+    *,
+    actor_id: Optional[str] = None,
+    expiry_hours: Optional[int] = None,
+) -> list[Dict[str, Any]]:
+    if expiry_hours is not None:
+        expire_open_clarifications(engine, expiry_hours, actor_id=actor_id)
+    stmt = select(clarifications).where(clarifications.c.status == "open")
+    if actor_id:
+        stmt = stmt.where(clarifications.c.actor_id == actor_id)
+    stmt = stmt.order_by(clarifications.c.created_at.asc())
     with engine.begin() as conn:
-        rows = conn.execute(
-            select(clarifications)
-            .where(clarifications.c.status == "open")
-            .order_by(clarifications.c.created_at.asc())
-        ).mappings().all()
+        rows = conn.execute(stmt).mappings().all()
         return [dict(row) for row in rows]
 
 
@@ -166,6 +195,54 @@ def answer_clarification(
             answer=answer_payload,
             answered_at=text("now()"),
         )
+        .returning(*clarifications.c)
+    )
+    with engine.begin() as conn:
+        row = conn.execute(stmt).mappings().first()
+        return dict(row) if row else None
+
+
+def expire_open_clarifications(
+    engine: Engine,
+    expiry_hours: int,
+    *,
+    intent_id: Optional[str] = None,
+    actor_id: Optional[str] = None,
+) -> list[str]:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=expiry_hours)
+    stmt = update(clarifications).where(
+        clarifications.c.status == "open",
+        clarifications.c.created_at < cutoff,
+    )
+    if intent_id:
+        stmt = stmt.where(clarifications.c.intent_id == intent_id)
+    if actor_id:
+        stmt = stmt.where(clarifications.c.actor_id == actor_id)
+    stmt = stmt.values(status="expired").returning(clarifications.c.intent_id)
+    with engine.begin() as conn:
+        intent_rows = conn.execute(stmt).fetchall()
+        intent_ids = [row[0] for row in intent_rows if row[0]]
+        if intent_ids:
+            conn.execute(
+                update(intents)
+                .where(intents.c.intent_id.in_(intent_ids), intents.c.status == "needs_clarification")
+                .values(status="expired", updated_at=text("now()"))
+            )
+        return intent_ids
+
+
+def expire_clarification(
+    engine: Engine,
+    *,
+    clarification_id: str,
+) -> Optional[Dict[str, Any]]:
+    stmt = (
+        update(clarifications)
+        .where(
+            clarifications.c.clarification_id == clarification_id,
+            clarifications.c.status == "open",
+        )
+        .values(status="expired")
         .returning(*clarifications.c)
     )
     with engine.begin() as conn:
