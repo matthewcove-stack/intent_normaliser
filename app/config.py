@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     min_confidence_to_write: float = 0.75
     max_inferred_fields: int = 2
     execute_actions: bool = False
+    gateway_base_url: str | None = None
+    gateway_bearer_token: str | None = None
+    gateway_tasks_create_path: str = "/v1/notion/tasks/create"
+    gateway_tasks_update_path: str = "/v1/notion/tasks/update"
+    gateway_timeout_seconds: float = 15.0
     context_api_base_url: str | None = None
     context_api_bearer_token: str | None = None
     context_api_project_search_path: str = "/v1/projects/search"

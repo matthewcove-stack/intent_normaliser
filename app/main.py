@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
+import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+import httpx
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import Settings, settings as default_settings
@@ -123,6 +125,98 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
 
     def compute_action_idempotency_key(action: str, payload: Dict[str, Any]) -> str:
         return f"action:{sha256_hex(canonical_json({'action': action, 'payload': payload}))}"
+
+    def build_gateway_request(
+        action_packet: ActionPacket,
+        actor_id: Optional[str],
+        settings: Settings,
+    ) -> tuple[str, Dict[str, Any]]:
+        action_name = action_packet.action or ""
+        payload = action_packet.payload or {}
+        if action_name == "notion.tasks.create":
+            endpoint = settings.gateway_tasks_create_path
+            gateway_payload = {"task": payload}
+        elif action_name == "notion.tasks.update":
+            endpoint = settings.gateway_tasks_update_path
+            gateway_payload = payload
+            if not isinstance(gateway_payload, dict) or not gateway_payload.get("notion_page_id"):
+                raise ValueError("Missing notion_page_id for update")
+        else:
+            raise ValueError(f"Unsupported action: {action_name}")
+        idempotency_key = action_packet.idempotency_key or compute_action_idempotency_key(action_name, payload)
+        envelope = {
+            "request_id": str(uuid.uuid4()),
+            "idempotency_key": idempotency_key,
+            "actor": actor_id or "intent_normaliser",
+            "payload": gateway_payload,
+        }
+        return endpoint, envelope
+
+    def execute_plan(
+        intent_id: str,
+        correlation_id: str,
+        actor_id: Optional[str],
+        plan: Plan,
+        settings: Settings,
+    ) -> tuple[bool, list[Dict[str, Any]]]:
+        if not settings.gateway_base_url or not settings.gateway_bearer_token:
+            raise ValueError("Gateway execution not configured")
+        results: list[Dict[str, Any]] = []
+        headers = {"Authorization": f"Bearer {settings.gateway_bearer_token}", "Content-Type": "application/json"}
+        base_url = settings.gateway_base_url.rstrip("/")
+        with httpx.Client(timeout=settings.gateway_timeout_seconds) as client:
+            for action in plan.actions:
+                action_name = action.action or ""
+                success = False
+                response_body = None
+                status_code = None
+                error_message = None
+                request_envelope: Dict[str, Any] = {}
+                endpoint = ""
+                try:
+                    endpoint, request_envelope = build_gateway_request(action, actor_id, settings)
+                    url = f"{base_url}{endpoint}"
+                    response = client.post(url, json=request_envelope, headers=headers)
+                    status_code = response.status_code
+                    response_body = response.text
+                    success = response.status_code == 200
+                except Exception as exc:
+                    error_message = str(exc)
+
+                result = {
+                    "action": action_name,
+                    "endpoint": endpoint,
+                    "request_id": request_envelope.get("request_id"),
+                    "idempotency_key": request_envelope.get("idempotency_key"),
+                    "status_code": status_code,
+                    "success": success,
+                    "response_body": response_body,
+                    "error": error_message,
+                }
+                results.append(result)
+
+                persist_artifact(
+                    packet={
+                        "request": request_envelope,
+                        "response": {
+                            "status_code": status_code,
+                            "body": response_body,
+                            "error": error_message,
+                        },
+                        "success": success,
+                    },
+                    kind="action",
+                    intent_type=None,
+                    action=action_name,
+                    intent_id=intent_id,
+                    correlation_id=correlation_id,
+                    status="executed" if success else "failed",
+                    idempotency_key=request_envelope.get("idempotency_key"),
+                    settings=settings,
+                )
+
+        all_success = all(item["success"] for item in results)
+        return all_success, results
 
     def build_plan(intent_id: str, correlation_id: str, final_canonical: Dict[str, Any]) -> Plan:
         intent_type = final_canonical.get("intent_type")
@@ -358,6 +452,76 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 correlation_id=correlation_id,
                 plan=plan,
             )
+            if settings.execute_actions:
+                try:
+                    all_success, execution_results = execute_plan(
+                        intent_id=intent_id,
+                        correlation_id=correlation_id,
+                        actor_id=actor_id,
+                        plan=plan,
+                        settings=settings,
+                    )
+                except ValueError as exc:
+                    intent_row = update_intent(app.state.engine, intent_id=intent_id, status="failed")
+                    response_payload = IngestResponse(
+                        status="rejected",
+                        error_code="EXECUTION_NOT_CONFIGURED",
+                        message=str(exc),
+                        details={"execution_results": []},
+                        intent_id=intent_id,
+                        correlation_id=correlation_id,
+                    )
+                    persist_artifact(
+                        packet=response_payload.model_dump(mode="json", exclude_none=True),
+                        kind="intent",
+                        intent_type=packet.intent_type,
+                        action=None,
+                        intent_id=intent_id,
+                        correlation_id=correlation_id,
+                        status="failed",
+                        idempotency_key=idempotency_key,
+                        settings=settings,
+                    )
+                    return response_payload
+
+                if not all_success:
+                    update_intent(app.state.engine, intent_id=intent_id, status="failed")
+                    response_payload = IngestResponse(
+                        status="rejected",
+                        error_code="EXECUTION_FAILED",
+                        message="One or more actions failed",
+                        details={"execution_results": execution_results},
+                        intent_id=intent_id,
+                        correlation_id=correlation_id,
+                    )
+                    persist_artifact(
+                        packet=response_payload.model_dump(mode="json", exclude_none=True),
+                        kind="intent",
+                        intent_type=packet.intent_type,
+                        action=None,
+                        intent_id=intent_id,
+                        correlation_id=correlation_id,
+                        status="failed",
+                        idempotency_key=idempotency_key,
+                        settings=settings,
+                    )
+                    return response_payload
+
+                response_payload.details = {"execution_results": execution_results}
+                persist_artifact(
+                    packet={
+                        "status": "executed",
+                        "execution_results": execution_results,
+                    },
+                    kind="intent",
+                    intent_type=packet.intent_type,
+                    action=None,
+                    intent_id=intent_id,
+                    correlation_id=correlation_id,
+                    status="executed",
+                    idempotency_key=idempotency_key,
+                    settings=settings,
+                )
             persist_artifact(
                 packet={
                     "status": "ready",
