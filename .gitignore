@@ -30,3 +30,10 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local sibling repos
+notion_assistant_contracts/
+context_api/
+notion_gateway/
+chat_to_notion_runner/
+

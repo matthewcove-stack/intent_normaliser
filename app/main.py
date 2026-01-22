@@ -104,11 +104,6 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unavailable")
 
     def compute_idempotency_key(packet: Dict[str, Any]) -> str:
-        conversation_id = packet.get("conversation_id")
-        message_id = packet.get("message_id")
-        intent_type = packet.get("intent_type")
-        if conversation_id and message_id and intent_type:
-            return f"intent:{conversation_id}:{message_id}:{intent_type}"
         return f"intent:{sha256_hex(canonical_json(packet))}"
 
     def build_plan(intent_id: str, correlation_id: str, final_canonical: Dict[str, Any]) -> Plan:
@@ -256,7 +251,13 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unavailable")
             return response_payload
 
-        result = normalize_intent(packet_data, user_timezone=settings.user_timezone, resolver=PROJECT_RESOLVER)
+        result = normalize_intent(
+            packet_data,
+            user_timezone=settings.user_timezone,
+            resolver=PROJECT_RESOLVER,
+            project_resolution_threshold=settings.project_resolution_threshold,
+            project_resolution_margin=settings.project_resolution_margin,
+        )
         if result.status == "needs_clarification":
             clarification_row = create_clarification(
                 app.state.engine,
@@ -471,6 +472,8 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             updated_packet,
             user_timezone=settings.user_timezone,
             resolver=PROJECT_RESOLVER,
+            project_resolution_threshold=settings.project_resolution_threshold,
+            project_resolution_margin=settings.project_resolution_margin,
         )
 
         if result.status == "needs_clarification":

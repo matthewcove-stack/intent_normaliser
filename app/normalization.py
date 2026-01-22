@@ -63,11 +63,46 @@ def _resolve_relative_due(value: str, user_timezone: str) -> Optional[str]:
     return None
 
 
+def _is_iso_datetime(value: str) -> bool:
+    try:
+        datetime.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _select_high_confidence_candidate(
+    candidates: Iterable[Dict[str, Any]],
+    *,
+    threshold: float,
+    margin: float,
+) -> Optional[Dict[str, Any]]:
+    scored = []
+    for candidate in candidates:
+        score = candidate.get("score")
+        if score is None:
+            score = 0.0
+        scored.append((float(score), candidate))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top_score, top_candidate = scored[0]
+    if top_score < threshold:
+        return None
+    if len(scored) > 1:
+        second_score = scored[1][0]
+        if (top_score - second_score) < margin:
+            return None
+    return top_candidate
+
+
 def normalize_intent(
     packet: Dict[str, Any],
     *,
     user_timezone: str,
     resolver: ProjectResolver,
+    project_resolution_threshold: float = 0.90,
+    project_resolution_margin: float = 0.10,
 ) -> NormalizationResult:
     intent_type = packet.get("intent_type")
     fields = packet.get("fields") or {}
@@ -112,33 +147,60 @@ def normalize_intent(
         project_value = fields.get("project")
         if isinstance(project_value, str):
             candidates = resolver.resolve(project_value)
-            canonical_draft = {
-                "intent_type": intent_type,
-                "fields": {
-                    **canonical_fields,
-                    "project": {"selector": project_value, "project_id": None},
-                },
-                "pending": {"field": "project", "selector": project_value},
-            }
-            expected_type = "choice" if candidates else "free_text"
-            return NormalizationResult(
-                status="needs_clarification",
-                canonical_draft=canonical_draft,
-                clarification=ClarificationPayload(
-                    question=(
-                        f"Which project matches '{project_value}'?"
-                        if candidates
-                        else f"Provide the project id for '{project_value}'."
-                    ),
-                    expected_answer_type=expected_type,
-                    candidates=candidates,
-                ),
+            resolved = _select_high_confidence_candidate(
+                candidates,
+                threshold=project_resolution_threshold,
+                margin=project_resolution_margin,
             )
+            if resolved and resolved.get("id"):
+                canonical_fields["project_id"] = resolved["id"]
+            else:
+                canonical_draft = {
+                    "intent_type": intent_type,
+                    "fields": {
+                        **canonical_fields,
+                        "project": {"selector": project_value, "project_id": None},
+                    },
+                    "pending": {"field": "project", "selector": project_value},
+                }
+                expected_type = "choice" if candidates else "free_text"
+                return NormalizationResult(
+                    status="needs_clarification",
+                    canonical_draft=canonical_draft,
+                    clarification=ClarificationPayload(
+                        question=(
+                            f"Which project matches '{project_value}'?"
+                            if candidates
+                            else f"Provide the project id for '{project_value}'."
+                        ),
+                        expected_answer_type=expected_type,
+                        candidates=candidates,
+                    ),
+                )
 
     due_value = fields.get("due")
-    if isinstance(due_value, str) and _relative_due_label(due_value):
-        resolved = _resolve_relative_due(due_value, user_timezone)
-        if not resolved:
+    if isinstance(due_value, str):
+        if _relative_due_label(due_value):
+            resolved = _resolve_relative_due(due_value, user_timezone)
+            if not resolved:
+                canonical_draft = {
+                    "intent_type": intent_type,
+                    "fields": {**canonical_fields, "due": {"selector": due_value}},
+                    "pending": {"field": "due", "selector": due_value},
+                }
+                return NormalizationResult(
+                    status="needs_clarification",
+                    canonical_draft=canonical_draft,
+                    clarification=ClarificationPayload(
+                        question="What is the due date?",
+                        expected_answer_type="date",
+                        candidates=[],
+                    ),
+                )
+            canonical_fields["due"] = resolved
+        elif _is_iso_datetime(due_value):
+            canonical_fields["due"] = due_value
+        else:
             canonical_draft = {
                 "intent_type": intent_type,
                 "fields": {**canonical_fields, "due": {"selector": due_value}},
@@ -153,7 +215,6 @@ def normalize_intent(
                     candidates=[],
                 ),
             )
-        canonical_fields["due"] = resolved
     elif due_value is not None:
         canonical_fields["due"] = due_value
 

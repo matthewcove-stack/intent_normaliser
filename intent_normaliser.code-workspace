@@ -4,10 +4,16 @@
       "path": "."
     },
     {
-      "path": "notion_ai"
+      "path": "notion_gateway"
     },
     {
       "path": "chat_to_notion_runner"
+    },
+    {
+      "path": "notion_assistant_contracts"
+    },
+    {
+      "path": "context_api"
     }
   ],
   "settings": {},

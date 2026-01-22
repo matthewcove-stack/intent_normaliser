@@ -17,6 +17,9 @@ def build_settings() -> Settings:
         min_confidence_to_write=0.75,
         max_inferred_fields=2,
         execute_actions=False,
+        clarification_expiry_hours=72,
+        project_resolution_threshold=0.90,
+        project_resolution_margin=0.10,
         version="0.0.0",
         git_sha="test",
         artifact_version=1,
@@ -136,6 +139,12 @@ def test_answer_clarification_by_choice_id_resumes_to_ready() -> None:
             sa.text("SELECT status FROM intents WHERE intent_id = :intent_id"),
             {"intent_id": intent_id},
         ).scalar_one()
+        answered_count = conn.execute(
+            sa.text(
+                "SELECT count(*) FROM intent_artifacts WHERE intent_id = :intent_id AND status = 'clarification_answered'"
+            ),
+            {"intent_id": intent_id},
+        ).scalar_one()
         ready_count = conn.execute(
             sa.text(
                 "SELECT count(*) FROM intent_artifacts WHERE intent_id = :intent_id AND status = 'ready'"
@@ -144,6 +153,7 @@ def test_answer_clarification_by_choice_id_resumes_to_ready() -> None:
         ).scalar_one()
 
     assert intent_status == "ready"
+    assert answered_count >= 1
     assert ready_count >= 1
 
 
