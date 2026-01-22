@@ -124,8 +124,17 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         return f"action:{sha256_hex(canonical_json({'action': action, 'payload': payload}))}"
 
     def build_plan(intent_id: str, correlation_id: str, final_canonical: Dict[str, Any]) -> Plan:
-        action_name = "notion.tasks.create"
-        payload = final_canonical.get("fields", {})
+        intent_type = final_canonical.get("intent_type")
+        fields = final_canonical.get("fields", {})
+        if intent_type == "update_task":
+            action_name = "notion.tasks.update"
+            payload = {
+                "notion_page_id": fields.get("task_id"),
+                "patch": fields.get("patch", {}),
+            }
+        else:
+            action_name = "notion.tasks.create"
+            payload = fields
         action_packet = {
             "kind": "action",
             "action": action_name,
@@ -277,6 +286,8 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             resolver=app.state.project_resolver,
             project_resolution_threshold=settings.project_resolution_threshold,
             project_resolution_margin=settings.project_resolution_margin,
+            min_confidence_to_write=settings.min_confidence_to_write,
+            max_inferred_fields=settings.max_inferred_fields,
         )
         if result.status == "needs_clarification":
             clarification_row = create_clarification(
@@ -494,6 +505,8 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             resolver=app.state.project_resolver,
             project_resolution_threshold=settings.project_resolution_threshold,
             project_resolution_margin=settings.project_resolution_margin,
+            min_confidence_to_write=settings.min_confidence_to_write,
+            max_inferred_fields=settings.max_inferred_fields,
         )
 
         if result.status == "needs_clarification":

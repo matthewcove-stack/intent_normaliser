@@ -191,3 +191,64 @@ def test_idempotent_repost_returns_same_intent() -> None:
         ).scalar_one()
 
     assert clarifications == 1
+
+
+def test_low_confidence_rejected() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "intent_type": "create_task",
+        "confidence": 0.1,
+        "fields": {"title": "Low confidence task"},
+    }
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "rejected"
+    assert data["error_code"] == "POLICY_LOW_CONFIDENCE"
+
+
+def test_update_task_requires_task_id() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "intent_type": "update_task",
+        "fields": {"status": "In Progress"},
+    }
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "rejected"
+    assert data["error_code"] == "POLICY_MISSING_TASK_ID"
+
+
+def test_update_task_ready_returns_patch_payload() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "intent_type": "update_task",
+        "fields": {"task_id": "task_123", "status": "In Progress"},
+    }
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ready"
+    action = data["plan"]["actions"][0]
+    assert action["action"] == "notion.tasks.update"
+    assert action["payload"]["notion_page_id"] == "task_123"
+    assert action["payload"]["patch"]["status"] == "In Progress"

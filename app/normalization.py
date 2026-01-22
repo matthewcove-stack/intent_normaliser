@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Literal, Optional
 from zoneinfo import ZoneInfo
 
@@ -80,14 +80,38 @@ class NormalizationResult:
     details: Optional[Dict[str, Any]] = None
 
 
+_WEEKDAYS = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
 def _relative_due_label(value: str) -> Optional[str]:
     lowered = value.strip().lower()
-    if lowered in {"today", "tomorrow", "next monday", "next week monday"}:
+    if lowered in {"today", "tomorrow", "next week", "next week monday"}:
+        return lowered
+    if lowered.startswith("next "):
+        weekday = lowered.replace("next ", "", 1).strip()
+        if weekday in _WEEKDAYS:
+            return lowered
+    if lowered in _WEEKDAYS:
         return lowered
     return None
 
 
-def _resolve_relative_due(value: str, user_timezone: str) -> Optional[str]:
+def _next_weekday(start: date, weekday: int, *, strict_future: bool) -> date:
+    days_ahead = (weekday - start.weekday()) % 7
+    if days_ahead == 0 and strict_future:
+        days_ahead = 7
+    return start + timedelta(days=days_ahead)
+
+
+def _resolve_relative_due(value: str, user_timezone: str) -> Optional[tuple[str, str]]:
     label = _relative_due_label(value)
     if not label:
         return None
@@ -97,20 +121,33 @@ def _resolve_relative_due(value: str, user_timezone: str) -> Optional[str]:
         return None
     now = datetime.now(zone).date()
     if label == "today":
-        return now.isoformat()
+        return now.isoformat(), "today"
     if label == "tomorrow":
-        return (now + timedelta(days=1)).isoformat()
-    if label in {"next monday", "next week monday"}:
-        days_ahead = (7 - now.weekday() + 0) % 7
-        if days_ahead == 0:
-            days_ahead = 7
-        return (now + timedelta(days=days_ahead)).isoformat()
+        return (now + timedelta(days=1)).isoformat(), "tomorrow"
+    if label in {"next week", "next week monday"}:
+        target = _next_weekday(now + timedelta(days=7), _WEEKDAYS["monday"], strict_future=False)
+        return target.isoformat(), "next_week_monday"
+    if label.startswith("next "):
+        weekday = label.replace("next ", "", 1).strip()
+        target = _next_weekday(now, _WEEKDAYS[weekday], strict_future=True)
+        return target.isoformat(), f"next_{weekday}"
+    if label in _WEEKDAYS:
+        target = _next_weekday(now, _WEEKDAYS[label], strict_future=True)
+        return target.isoformat(), f"next_{label}"
     return None
 
 
 def _is_iso_datetime(value: str) -> bool:
     try:
         datetime.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_iso_date(value: str) -> bool:
+    try:
+        date.fromisoformat(value)
         return True
     except ValueError:
         return False
@@ -148,9 +185,25 @@ def normalize_intent(
     resolver: ProjectResolver,
     project_resolution_threshold: float = 0.90,
     project_resolution_margin: float = 0.10,
+    min_confidence_to_write: float = 0.75,
+    max_inferred_fields: int = 2,
 ) -> NormalizationResult:
     intent_type = packet.get("intent_type")
     fields = packet.get("fields") or {}
+    confidence = packet.get("confidence")
+
+    if confidence is not None:
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            confidence_value = None
+        if confidence_value is not None and confidence_value < min_confidence_to_write:
+            return NormalizationResult(
+                status="rejected",
+                error_code="POLICY_LOW_CONFIDENCE",
+                message="Confidence below minimum threshold",
+                details={"confidence": confidence_value, "threshold": min_confidence_to_write},
+            )
 
     if not intent_type:
         canonical_draft = {
@@ -168,62 +221,87 @@ def normalize_intent(
             ),
         )
 
-    if intent_type != "create_task":
+    if intent_type not in {"create_task", "update_task"}:
         return NormalizationResult(
             status="rejected",
             error_code="UNSUPPORTED_INTENT_TYPE",
             message=f"Unsupported intent_type: {intent_type}",
         )
 
-    title = fields.get("title") or packet.get("title")
-    if not title:
-        return NormalizationResult(
-            status="rejected",
-            error_code="VALIDATION_ERROR",
-            message="Missing required field: title",
-            details={"field": "title"},
-        )
+    inferred_fields = []
 
-    canonical_fields: Dict[str, Any] = {"title": title}
-
-    if "project_id" in fields:
-        canonical_fields["project_id"] = fields.get("project_id")
-    elif "project" in fields:
-        project_value = fields.get("project")
-        if isinstance(project_value, str):
-            candidates = resolver.resolve(project_value)
-            resolved = _select_high_confidence_candidate(
-                candidates,
-                threshold=project_resolution_threshold,
-                margin=project_resolution_margin,
+    canonical_fields: Dict[str, Any] = {}
+    if intent_type == "create_task":
+        title = fields.get("title") or packet.get("title")
+        if not title:
+            return NormalizationResult(
+                status="rejected",
+                error_code="VALIDATION_ERROR",
+                message="Missing required field: title",
+                details={"field": "title"},
             )
-            if resolved and resolved.get("id"):
-                canonical_fields["project_id"] = resolved["id"]
-            else:
-                canonical_draft = {
-                    "intent_type": intent_type,
-                    "fields": {
-                        **canonical_fields,
-                        "project": {"selector": project_value, "project_id": None},
-                    },
-                    "pending": {"field": "project", "selector": project_value},
-                }
-                expected_type = "choice" if candidates else "free_text"
-                return NormalizationResult(
-                    status="needs_clarification",
-                    canonical_draft=canonical_draft,
-                    clarification=ClarificationPayload(
-                        question=(
-                            f"Which project matches '{project_value}'?"
-                            if candidates
-                            else f"Provide the project id for '{project_value}'."
-                        ),
-                        expected_answer_type=expected_type,
-                        candidates=candidates,
-                    ),
+        canonical_fields["title"] = title
+        if "status" in fields:
+            canonical_fields["status"] = fields.get("status")
+        if "priority" in fields:
+            canonical_fields["priority"] = fields.get("priority")
+    else:
+        task_id = fields.get("task_id") or fields.get("notion_page_id")
+        if not task_id:
+            return NormalizationResult(
+                status="rejected",
+                error_code="POLICY_MISSING_TASK_ID",
+                message="Missing required field: task_id",
+                details={"field": "task_id"},
+            )
+        canonical_fields["task_id"] = task_id
+
+    if intent_type == "create_task":
+        if "project_id" in fields:
+            canonical_fields["project_id"] = fields.get("project_id")
+        elif "project" in fields:
+            project_value = fields.get("project")
+            if isinstance(project_value, str):
+                candidates = resolver.resolve(project_value)
+                resolved = _select_high_confidence_candidate(
+                    candidates,
+                    threshold=project_resolution_threshold,
+                    margin=project_resolution_margin,
                 )
+                if resolved and resolved.get("id"):
+                    canonical_fields["project_id"] = resolved["id"]
+                else:
+                    canonical_draft = {
+                        "intent_type": intent_type,
+                        "fields": {
+                            **canonical_fields,
+                            "project": {"selector": project_value, "project_id": None},
+                        },
+                        "pending": {"field": "project", "selector": project_value},
+                    }
+                    expected_type = "choice" if candidates else "free_text"
+                    return NormalizationResult(
+                        status="needs_clarification",
+                        canonical_draft=canonical_draft,
+                        clarification=ClarificationPayload(
+                            question=(
+                                f"Which project matches '{project_value}'?"
+                                if candidates
+                                else f"Provide the project id for '{project_value}'."
+                            ),
+                            expected_answer_type=expected_type,
+                            candidates=candidates,
+                        ),
+                    )
 
     due_value = fields.get("due")
+    patch_fields: Dict[str, Any] = {}
+    if intent_type == "update_task":
+        if "status" in fields:
+            patch_fields["status"] = fields.get("status")
+        if "priority" in fields:
+            patch_fields["priority"] = fields.get("priority")
+
     if isinstance(due_value, str):
         if _relative_due_label(due_value):
             resolved = _resolve_relative_due(due_value, user_timezone)
@@ -242,9 +320,23 @@ def normalize_intent(
                         candidates=[],
                     ),
                 )
-            canonical_fields["due"] = resolved
-        elif _is_iso_datetime(due_value):
-            canonical_fields["due"] = due_value
+            resolved_value, strategy = resolved
+            inferred_fields.append(
+                {
+                    "field": "due",
+                    "inferred_from": due_value,
+                    "strategy": strategy,
+                }
+            )
+            if intent_type == "update_task":
+                patch_fields["due"] = resolved_value
+            else:
+                canonical_fields["due"] = resolved_value
+        elif _is_iso_datetime(due_value) or _is_iso_date(due_value):
+            if intent_type == "update_task":
+                patch_fields["due"] = due_value
+            else:
+                canonical_fields["due"] = due_value
         else:
             canonical_draft = {
                 "intent_type": intent_type,
@@ -261,16 +353,50 @@ def normalize_intent(
                 ),
             )
     elif due_value is not None:
-        canonical_fields["due"] = due_value
+        if intent_type == "update_task":
+            patch_fields["due"] = due_value
+        else:
+            canonical_fields["due"] = due_value
 
-    final_canonical = {"intent_type": intent_type, "fields": canonical_fields}
+    if inferred_fields and len(inferred_fields) > max_inferred_fields:
+        return NormalizationResult(
+            status="rejected",
+            error_code="POLICY_TOO_MANY_INFERENCES",
+            message="Too many inferred fields",
+            details={"inferred_fields": inferred_fields, "max_inferred_fields": max_inferred_fields},
+        )
+
+    if intent_type == "update_task":
+        if not patch_fields:
+            return NormalizationResult(
+                status="rejected",
+                error_code="VALIDATION_ERROR",
+                message="No updatable fields provided",
+                details={"fields": list(fields.keys())},
+            )
+        canonical_fields["patch"] = patch_fields
+
+    final_canonical = {
+        "intent_type": intent_type,
+        "fields": canonical_fields,
+        "resolution": {"inferences": inferred_fields},
+    }
+    if intent_type == "update_task":
+        payload = {
+            "notion_page_id": canonical_fields.get("task_id"),
+            "patch": canonical_fields.get("patch", {}),
+        }
+        action = "notion.tasks.update"
+    else:
+        payload = canonical_fields
+        action = "notion.tasks.create"
     plan = [
         {
             "kind": "action",
-            "action": "notion.tasks.create",
+            "action": action,
             "intent_id": packet.get("intent_id"),
             "correlation_id": packet.get("correlation_id"),
-            "payload": canonical_fields,
+            "payload": payload,
         }
     ]
     return NormalizationResult(
