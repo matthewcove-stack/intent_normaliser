@@ -4,7 +4,7 @@ Phase 0 skeleton for the Intent Normaliser Service. This includes a FastAPI app,
 
 ## Workspace
 
-Open `intent_normaliser.code-workspace` in VS Code to load this repo plus the related `notion_gateway` and `chat_to_notion_runner` repos. Keep those folders next to this one so the relative paths resolve on each machine.
+Open `intent_normaliser.code-workspace` in VS Code to load this repo plus the related `notion_gateway` and `action_relay` repos. Keep those folders next to this one so the relative paths resolve on each machine.
 
 ## Quickstart (Docker)
 

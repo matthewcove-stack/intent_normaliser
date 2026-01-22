@@ -35,5 +35,5 @@ Thumbs.db
 notion_assistant_contracts/
 context_api/
 notion_gateway/
-chat_to_notion_runner/
+action_relay/
 

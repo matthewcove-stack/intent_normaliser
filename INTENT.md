@@ -26,7 +26,7 @@ n8n remains a deterministic execution kernel; this service is the decision firew
 
 ## Core Responsibilities (Updated)
 
-* Single target for ChatGPT runners (`chat_to_notion_runner`)
+* Single target for ChatGPT runners (`action_relay`)
 * Canonicalise ambiguous intent into deterministic, executable plans
 * Block ambiguous or unsafe requests by default
 * Perform **controlled inference** (e.g. “next week” → ISO date) with full traceability
@@ -297,4 +297,3 @@ Add tests for:
 ## Phase Plan
 
 Phase structure remains unchanged, with clarification endpoints and state added in Phase 1.
-

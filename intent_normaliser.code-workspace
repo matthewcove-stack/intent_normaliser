@@ -7,7 +7,7 @@
       "path": "notion_gateway"
     },
     {
-      "path": "chat_to_notion_runner"
+      "path": "action_relay"
     },
     {
       "path": "notion_assistant_contracts"
