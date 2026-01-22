@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Literal, Optional
 from zoneinfo import ZoneInfo
 
+import httpx
+
 
 class ProjectResolver:
     def resolve(self, selector: str) -> List[Dict[str, Any]]:
@@ -14,6 +16,49 @@ class ProjectResolver:
 class StubProjectResolver(ProjectResolver):
     def resolve(self, selector: str) -> List[Dict[str, Any]]:
         return []
+
+
+class HttpProjectResolver(ProjectResolver):
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        bearer_token: Optional[str] = None,
+        search_path: str = "/v1/projects/search",
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._bearer_token = bearer_token
+        self._search_path = search_path
+        self._timeout_seconds = timeout_seconds
+
+    def resolve(self, selector: str) -> List[Dict[str, Any]]:
+        url = f"{self._base_url}{self._search_path}"
+        headers = {"Content-Type": "application/json"}
+        if self._bearer_token:
+            headers["Authorization"] = f"Bearer {self._bearer_token}"
+        payload = {"query": selector, "limit": 5}
+        try:
+            response = httpx.post(url, json=payload, headers=headers, timeout=self._timeout_seconds)
+        except httpx.RequestError:
+            return []
+        if response.status_code != 200:
+            return []
+        try:
+            data = response.json()
+        except ValueError:
+            return []
+        candidates = data.get("results") or data.get("candidates") or []
+        if not isinstance(candidates, list):
+            return []
+        normalized: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if "score" not in candidate and "confidence" in candidate:
+                candidate = {**candidate, "score": candidate.get("confidence")}
+            normalized.append(candidate)
+        return normalized
 
 
 @dataclass
@@ -222,10 +267,10 @@ def normalize_intent(
     plan = [
         {
             "kind": "action",
-            "action": "create_task",
+            "action": "notion.tasks.create",
             "intent_id": packet.get("intent_id"),
             "correlation_id": packet.get("correlation_id"),
-            "fields": canonical_fields,
+            "payload": canonical_fields,
         }
     ]
     return NormalizationResult(

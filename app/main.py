@@ -16,6 +16,8 @@ from app.models.packets import (
     Plan,
 )
 from app.normalization import (
+    HttpProjectResolver,
+    ProjectResolver,
     StubProjectResolver,
     apply_clarification_answer,
     normalize_intent,
@@ -39,7 +41,6 @@ from app.util.ids import new_correlation_id, new_intent_id
 
 
 NOT_IMPLEMENTED_MESSAGE = "Phase 0: normalisation and execution are not implemented"
-PROJECT_RESOLVER = StubProjectResolver()
 
 
 def create_app(app_settings: Settings | None = None) -> FastAPI:
@@ -48,6 +49,19 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
 
     app.state.settings = app_settings
     app.state.engine = create_db_engine(app_settings.database_url)
+    app.state.project_resolver = None
+
+    def build_project_resolver(settings: Settings) -> ProjectResolver:
+        if settings.context_api_base_url:
+            return HttpProjectResolver(
+                base_url=settings.context_api_base_url,
+                bearer_token=settings.context_api_bearer_token,
+                search_path=settings.context_api_project_search_path,
+                timeout_seconds=settings.context_api_timeout_seconds,
+            )
+        return StubProjectResolver()
+
+    app.state.project_resolver = build_project_resolver(app_settings)
 
     def get_settings() -> Settings:
         return app.state.settings
@@ -106,13 +120,19 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
     def compute_idempotency_key(packet: Dict[str, Any]) -> str:
         return f"intent:{sha256_hex(canonical_json(packet))}"
 
+    def compute_action_idempotency_key(action: str, payload: Dict[str, Any]) -> str:
+        return f"action:{sha256_hex(canonical_json({'action': action, 'payload': payload}))}"
+
     def build_plan(intent_id: str, correlation_id: str, final_canonical: Dict[str, Any]) -> Plan:
+        action_name = "notion.tasks.create"
+        payload = final_canonical.get("fields", {})
         action_packet = {
             "kind": "action",
-            "action": "create_task",
+            "action": action_name,
             "intent_id": intent_id,
             "correlation_id": correlation_id,
-            "fields": final_canonical.get("fields", {}),
+            "idempotency_key": compute_action_idempotency_key(action_name, payload),
+            "payload": payload,
         }
         return Plan(actions=[ActionPacket.model_validate(action_packet)])
 
@@ -181,7 +201,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             "artifact_version": settings.artifact_version,
         }
 
-    @app.post("/v1/ingest/intent", response_model=IngestResponse)
+    @app.post("/v1/intents", response_model=IngestResponse)
     def ingest_intent(
         packet: IntentPacket,
         response: Response,
@@ -254,7 +274,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         result = normalize_intent(
             packet_data,
             user_timezone=settings.user_timezone,
-            resolver=PROJECT_RESOLVER,
+            resolver=app.state.project_resolver,
             project_resolution_threshold=settings.project_resolution_threshold,
             project_resolution_margin=settings.project_resolution_margin,
         )
@@ -351,7 +371,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         )
         return response_payload
 
-    @app.post("/v1/ingest/action", response_model=IngestResponse)
+    @app.post("/v1/actions", response_model=IngestResponse)
     def ingest_action(
         packet: ActionPacket,
         response: Response,
@@ -471,7 +491,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         result = normalize_intent(
             updated_packet,
             user_timezone=settings.user_timezone,
-            resolver=PROJECT_RESOLVER,
+            resolver=app.state.project_resolver,
             project_resolution_threshold=settings.project_resolution_threshold,
             project_resolution_margin=settings.project_resolution_margin,
         )

@@ -29,6 +29,10 @@ Optional:
 - `MIN_CONFIDENCE_TO_WRITE` (default: 0.75)
 - `MAX_INFERRED_FIELDS` (default: 2)
 - `EXECUTE_ACTIONS` (default: false)
+- `CONTEXT_API_BASE_URL` (default: unset)
+- `CONTEXT_API_BEARER_TOKEN` (default: unset)
+- `CONTEXT_API_PROJECT_SEARCH_PATH` (default: /v1/projects/search)
+- `CONTEXT_API_TIMEOUT_SECONDS` (default: 5)
 - `VERSION` (default: 0.0.0)
 - `GIT_SHA` (default: unknown)
 
@@ -42,11 +46,11 @@ Returns `{ "status": "ok" }` when the database is reachable. Returns `503` when 
 
 Returns `{ "version", "git_sha", "artifact_version" }`.
 
-### POST /v1/ingest/intent
+### POST /v1/intents
 
 Requires bearer auth. Writes a `received` artifact row and returns `NOT_IMPLEMENTED` for normalisation.
 
-### POST /v1/ingest/action
+### POST /v1/actions
 
 Requires bearer auth. Writes a `received` artifact row and returns `NOT_IMPLEMENTED` for execution.
 
@@ -61,14 +65,14 @@ curl -s http://localhost:8000/version
 ```
 
 ```bash
-curl -s -X POST http://localhost:8000/v1/ingest/intent \
+curl -s -X POST http://localhost:8000/v1/intents \
   -H "Authorization: Bearer change-me" \
   -H "Content-Type: application/json" \
   -d '{"kind":"intent","intent_type":"noop"}'
 ```
 
 ```bash
-curl -s -X POST http://localhost:8000/v1/ingest/action \
+curl -s -X POST http://localhost:8000/v1/actions \
   -H "Authorization: Bearer change-me" \
   -H "Content-Type: application/json" \
   -d '{"kind":"action","action":"notion.tasks.create"}'

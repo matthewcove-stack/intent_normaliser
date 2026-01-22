@@ -31,7 +31,7 @@ def test_auth_required() -> None:
     app = create_app(settings)
     client = TestClient(app)
 
-    response = client.post("/v1/ingest/intent", json={"kind": "intent"})
+    response = client.post("/v1/intents", json={"kind": "intent"})
 
     assert response.status_code == 401
 
@@ -42,7 +42,7 @@ def test_ingest_writes_artifact_row() -> None:
     client = TestClient(app)
 
     headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
-    response = client.post("/v1/ingest/intent", json={"kind": "intent", "intent_type": "noop"}, headers=headers)
+    response = client.post("/v1/intents", json={"kind": "intent", "intent_type": "noop"}, headers=headers)
 
     assert response.status_code == 200
     data = response.json()
@@ -82,7 +82,7 @@ def test_ingest_intent_creates_open_clarification_when_project_string_present() 
         "intent_type": "create_task",
         "fields": {"title": "Write the spec", "project": "John and Sagita"},
     }
-    response = client.post("/v1/ingest/intent", json=payload, headers=headers)
+    response = client.post("/v1/intents", json=payload, headers=headers)
 
     assert response.status_code == 200
     data = response.json()
@@ -118,7 +118,7 @@ def test_answer_clarification_by_choice_id_resumes_to_ready() -> None:
         "intent_type": "create_task",
         "fields": {"title": "Ship this", "project": "John and Sagita"},
     }
-    response = client.post("/v1/ingest/intent", json=payload, headers=headers)
+    response = client.post("/v1/intents", json=payload, headers=headers)
     clarification_id = response.json()["clarification"]["clarification_id"]
     intent_id = response.json()["intent_id"]
 
@@ -132,6 +132,10 @@ def test_answer_clarification_by_choice_id_resumes_to_ready() -> None:
     data = answer_response.json()
     assert data["status"] == "ready"
     assert data["plan"]["actions"]
+    action = data["plan"]["actions"][0]
+    assert action["action"] == "notion.tasks.create"
+    assert "payload" in action
+    assert action["payload"]["project_id"] == "proj_123"
 
     engine = sa.create_engine(settings.database_url, future=True)
     with engine.connect() as conn:
@@ -168,8 +172,8 @@ def test_idempotent_repost_returns_same_intent() -> None:
         "intent_type": "create_task",
         "fields": {"title": "Cleanup", "project": "John and Sagita"},
     }
-    response_one = client.post("/v1/ingest/intent", json=payload, headers=headers)
-    response_two = client.post("/v1/ingest/intent", json=payload, headers=headers)
+    response_one = client.post("/v1/intents", json=payload, headers=headers)
+    response_two = client.post("/v1/intents", json=payload, headers=headers)
 
     assert response_one.status_code == 200
     assert response_two.status_code == 200

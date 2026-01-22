@@ -14,6 +14,11 @@ class IntentPacket(BaseModel):
     correlation_id: Optional[str] = None
     conversation_id: Optional[str] = None
     message_id: Optional[str] = None
+    natural_language: Optional[str] = None
+    fields: Optional[Dict[str, Any]] = None
+    confidence: Optional[float] = None
+    source: Optional[str] = None
+    timestamp: Optional[str] = None
 
 
 class ActionPacket(BaseModel):
@@ -23,6 +28,11 @@ class ActionPacket(BaseModel):
     action: Optional[str] = None
     intent_id: Optional[str] = None
     correlation_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    step_id: Optional[str] = None
+    depends_on: Optional[List[str]] = None
+    fields: Optional[Dict[str, Any]] = None
+    payload: Optional[Dict[str, Any]] = None
 
 
 class ClarificationCandidate(BaseModel):
@@ -35,9 +45,11 @@ class Clarification(BaseModel):
     clarification_id: str
     intent_id: str
     question: str
-    expected_answer_type: str
+    expected_answer_type: Literal["choice", "free_text", "date", "datetime"]
     candidates: List[ClarificationCandidate]
-    status: str
+    status: Literal["open", "answered", "expired"]
+    answer: Optional[Dict[str, Any]] = None
+    answered_at: Optional[str] = None
 
 
 class Plan(BaseModel):
@@ -58,3 +70,4 @@ class IngestResponse(BaseModel):
     error_code: Optional[str] = None
     message: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
+    error: Optional[Dict[str, Any]] = None
