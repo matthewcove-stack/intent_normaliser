@@ -135,7 +135,7 @@ def test_answer_clarification_by_choice_id_resumes_to_ready() -> None:
     action = data["plan"]["actions"][0]
     assert action["action"] == "notion.tasks.create"
     assert "payload" in action
-    assert action["payload"]["project_id"] == "proj_123"
+    assert action["payload"]["project"] == "proj_123"
 
     engine = sa.create_engine(settings.database_url, future=True)
     with engine.connect() as conn:

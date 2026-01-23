@@ -178,6 +178,27 @@ def _select_high_confidence_candidate(
     return top_candidate
 
 
+def _normalize_project_candidates(candidates: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        original_id = candidate.get("id")
+        label = candidate.get("label") or candidate.get("name") or original_id
+        if not isinstance(label, str) or not label.strip():
+            continue
+        meta = dict(candidate.get("meta") or {})
+        if isinstance(original_id, str) and original_id != label:
+            meta.setdefault("project_id", original_id)
+        normalized_candidate = dict(candidate)
+        normalized_candidate["id"] = label
+        normalized_candidate["label"] = label
+        if meta:
+            normalized_candidate["meta"] = meta
+        normalized.append(normalized_candidate)
+    return normalized
+
+
 def normalize_intent(
     packet: Dict[str, Any],
     *,
@@ -257,42 +278,44 @@ def normalize_intent(
         canonical_fields["task_id"] = task_id
 
     if intent_type == "create_task":
-        if "project_id" in fields:
-            canonical_fields["project_id"] = fields.get("project_id")
-        elif "project" in fields:
+        project_value = None
+        if "project" in fields:
             project_value = fields.get("project")
-            if isinstance(project_value, str):
-                candidates = resolver.resolve(project_value)
-                resolved = _select_high_confidence_candidate(
-                    candidates,
-                    threshold=project_resolution_threshold,
-                    margin=project_resolution_margin,
-                )
-                if resolved and resolved.get("id"):
-                    canonical_fields["project_id"] = resolved["id"]
-                else:
-                    canonical_draft = {
-                        "intent_type": intent_type,
-                        "fields": {
-                            **canonical_fields,
-                            "project": {"selector": project_value, "project_id": None},
-                        },
-                        "pending": {"field": "project", "selector": project_value},
-                    }
-                    expected_type = "choice" if candidates else "free_text"
-                    return NormalizationResult(
-                        status="needs_clarification",
-                        canonical_draft=canonical_draft,
-                        clarification=ClarificationPayload(
-                            question=(
-                                f"Which project matches '{project_value}'?"
-                                if candidates
-                                else f"Provide the project id for '{project_value}'."
-                            ),
-                            expected_answer_type=expected_type,
-                            candidates=candidates,
+        elif "project_id" in fields:
+            project_value = fields.get("project_id")
+        if isinstance(project_value, str):
+            candidates = _normalize_project_candidates(resolver.resolve(project_value))
+            resolved = _select_high_confidence_candidate(
+                candidates,
+                threshold=project_resolution_threshold,
+                margin=project_resolution_margin,
+            )
+            if resolved:
+                label = resolved.get("label") or resolved.get("id")
+                canonical_fields["project"] = label or project_value
+            else:
+                canonical_draft = {
+                    "intent_type": intent_type,
+                    "fields": {
+                        **canonical_fields,
+                        "project": {"selector": project_value, "value": None},
+                    },
+                    "pending": {"field": "project", "selector": project_value},
+                }
+                expected_type = "choice" if candidates else "free_text"
+                return NormalizationResult(
+                    status="needs_clarification",
+                    canonical_draft=canonical_draft,
+                    clarification=ClarificationPayload(
+                        question=(
+                            f"Which project matches '{project_value}'?"
+                            if candidates
+                            else f"Provide the project name for '{project_value}'."
                         ),
-                    )
+                        expected_answer_type=expected_type,
+                        candidates=candidates,
+                    ),
+                )
 
     due_value = fields.get("due")
     patch_fields: Dict[str, Any] = {}
@@ -424,11 +447,11 @@ def apply_clarification_answer(
             canonical_draft["intent_type"] = choice_id
     elif field == "project":
         if choice_id:
-            fields["project_id"] = choice_id
-            fields.pop("project", None)
+            fields["project"] = choice_id
+            fields.pop("project_id", None)
         elif answer_text:
-            fields["project_id"] = answer_text
-            fields.pop("project", None)
+            fields["project"] = answer_text
+            fields.pop("project_id", None)
     elif field == "due":
         if answer_text:
             fields["due"] = answer_text

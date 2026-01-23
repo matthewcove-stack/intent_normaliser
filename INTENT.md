@@ -24,6 +24,14 @@ n8n remains a deterministic execution kernel; this service is the decision firew
 
 ---
 
+## Constraints
+
+* Docker-only for services and scripts.
+* No host-installed dependencies for the canonical workflow.
+* Use Docker service names (not localhost) for container-to-container calls.
+
+---
+
 ## Core Responsibilities (Updated)
 
 * Single target for ChatGPT runners (`action_relay`)
@@ -132,7 +140,7 @@ Intent Packets may contain ambiguity, relative values, or unresolved references.
   "payload": {
     "title": "Follow up with John",
     "due_date": "2026-01-26",
-    "project_id": "proj_abc123",
+    "project": "Sagitta - Loft",
     "priority": "medium"
   },
   "idempotency_key": "sha256:..."

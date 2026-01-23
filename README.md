@@ -14,7 +14,7 @@ Build and start Postgres, run migrations, and start the API:
 docker compose up --build
 ```
 
-Service will be available at `http://localhost:8000`.
+Service will be available at `http://localhost:8000` for host access. For container-to-container calls, use service names (for example `http://api:8000`) and avoid localhost.
 
 ## Configuration
 
@@ -29,12 +29,12 @@ Optional:
 - `MIN_CONFIDENCE_TO_WRITE` (default: 0.75)
 - `MAX_INFERRED_FIELDS` (default: 2)
 - `EXECUTE_ACTIONS` (default: false)
-- `GATEWAY_BASE_URL` (default: unset)
+- `GATEWAY_BASE_URL` (default: unset, use a Docker service name when running inside containers)
 - `GATEWAY_BEARER_TOKEN` (default: unset)
 - `GATEWAY_TASKS_CREATE_PATH` (default: /v1/notion/tasks/create)
 - `GATEWAY_TASKS_UPDATE_PATH` (default: /v1/notion/tasks/update)
 - `GATEWAY_TIMEOUT_SECONDS` (default: 15)
-- `CONTEXT_API_BASE_URL` (default: unset)
+- `CONTEXT_API_BASE_URL` (default: unset, use a Docker service name when running inside containers)
 - `CONTEXT_API_BEARER_TOKEN` (default: unset)
 - `CONTEXT_API_PROJECT_SEARCH_PATH` (default: /v1/projects/search)
 - `CONTEXT_API_TIMEOUT_SECONDS` (default: 5)
