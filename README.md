@@ -1,6 +1,6 @@
-# Intent Normaliser Service (Phase 0)
+# Intent Normaliser Service
 
-Phase 0 skeleton for the Intent Normaliser Service. This includes a FastAPI app, mandatory Postgres persistence (append-only), Alembic migrations, and Docker-first development.
+FastAPI service for intent ingestion, normalization, clarification handling, and append-only artifact persistence. Action execution is still a stub.
 
 ## Workspace
 
@@ -53,11 +53,29 @@ Returns `{ "version", "git_sha", "artifact_version" }`.
 
 ### POST /v1/intents
 
-Requires bearer auth. Writes a `received` artifact row and returns `NOT_IMPLEMENTED` for normalisation.
+Requires bearer auth. Writes a `received` artifact row, normalizes the intent, and returns one of:
+
+- `ready` with a plan
+- `needs_clarification` with a clarification payload
+- `rejected` with an error code
+
+Additional artifacts are written for each outcome.
+
+### GET /v1/intents/{intent_id}
+
+Requires bearer auth. Returns the current intent status and latest plan/clarification state.
 
 ### POST /v1/actions
 
-Requires bearer auth. Writes a `received` artifact row and returns `NOT_IMPLEMENTED` for execution.
+Requires bearer auth. Writes a `received` artifact row and returns `accepted`. Execution is not implemented yet.
+
+### GET /v1/clarifications?status=open
+
+Requires bearer auth. Returns open clarifications for the actor (if provided).
+
+### POST /v1/clarifications/{clarification_id}/answer
+
+Requires bearer auth. Submits an answer and resumes normalization.
 
 ## Curl examples
 
@@ -73,7 +91,7 @@ curl -s http://localhost:8000/version
 curl -s -X POST http://localhost:8000/v1/intents \
   -H "Authorization: Bearer change-me" \
   -H "Content-Type: application/json" \
-  -d '{"kind":"intent","intent_type":"noop"}'
+  -d '{"kind":"intent","intent_type":"create_task","fields":{"title":"Write spec","project":"Sagitta loft"}}'
 ```
 
 ```bash
