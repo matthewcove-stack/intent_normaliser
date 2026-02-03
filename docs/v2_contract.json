@@ -1,0 +1,10 @@
+{
+  "required_files": [
+    "AGENTS.md",
+    "docs/intent.md",
+    "docs/current_state.md",
+    "docs/phases.md",
+    "docs/phase_execution_prompt.md"
+  ],
+  "authoritative": "docs/current_state.md"
+}

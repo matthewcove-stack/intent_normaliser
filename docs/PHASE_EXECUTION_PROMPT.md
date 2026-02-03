@@ -1,15 +1,19 @@
-# Phase Execution Prompt — intent_normaliser
+# Phase Execution Prompt (Canonical)
 
-You are implementing a single requested phase for intent_normaliser.
+You are implementing the requested phase ONLY.
 
-Follow:
-- Repo `AGENTS.md` + this docs set
-- Truth hierarchy: docs/current_state.md > INTENT.md > docs/phases.md > README.md > code
+Rules:
+- Do not implement future phases.
+- Do not refactor unrelated code.
+- Follow docs/intent.md.
+- Update docs/current_state.md after changes.
+- Use the smallest safe assumptions; document them.
+- If verification fails twice, stop and report.
 
-Phase 1 focus (only):
-- Implement execution for the normalised plan (Notion task create/update) behind `EXECUTE_ACTIONS=true`.
-- Add idempotency for duplicate request_ids.
-- Persist execution artifacts and return an outcome payload.
-- Add/extend tests and run: `docker compose run --rm api pytest`.
+## Mandatory enforcement (Drift Guard MCP)
+Before claiming completion, call these MCP tools and ensure ok=true:
+- repo_contract_validate()
+- verify_run(profile="default")
+- drift_check()
 
-Stop and ask if you would change contracts, data integrity, or auth.
+Include the returned JSON in your final phase report.
