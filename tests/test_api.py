@@ -1,29 +1,72 @@
 from __future__ import annotations
 
 import os
+from typing import Any, Dict, List
+
+import pytest
 
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
 from app.config import Settings
+import app.main as main
 from app.main import create_app
 
 
-def build_settings() -> Settings:
-    return Settings(
-        database_url=os.environ["DATABASE_URL"],
-        intent_service_token=os.environ.get("INTENT_SERVICE_TOKEN", "change-me"),
-        user_timezone="Europe/London",
-        min_confidence_to_write=0.75,
-        max_inferred_fields=2,
-        execute_actions=False,
-        clarification_expiry_hours=72,
-        project_resolution_threshold=0.90,
-        project_resolution_margin=0.10,
-        version="0.0.0",
-        git_sha="test",
-        artifact_version=1,
-    )
+def build_settings(**overrides: Any) -> Settings:
+    values: Dict[str, Any] = {
+        "database_url": os.environ["DATABASE_URL"],
+        "intent_service_token": os.environ.get("INTENT_SERVICE_TOKEN", "change-me"),
+        "user_timezone": "Europe/London",
+        "min_confidence_to_write": 0.75,
+        "max_inferred_fields": 2,
+        "execute_actions": False,
+        "clarification_expiry_hours": 72,
+        "project_resolution_threshold": 0.90,
+        "project_resolution_margin": 0.10,
+        "version": "0.0.0",
+        "git_sha": "test",
+        "artifact_version": 1,
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+@pytest.fixture(autouse=True)
+def reset_database() -> None:
+    engine = sa.create_engine(os.environ["DATABASE_URL"], future=True)
+    with engine.begin() as conn:
+        conn.execute(sa.text("TRUNCATE intent_artifacts, clarifications, intents RESTART IDENTITY CASCADE"))
+
+
+class DummyResponse:
+    def __init__(self, status_code: int, json_data: Any = None, text: str = "") -> None:
+        self.status_code = status_code
+        self._json_data = json_data
+        self.text = text
+
+    def json(self) -> Any:
+        if self._json_data is None:
+            raise ValueError("No JSON")
+        return self._json_data
+
+
+class DummyClient:
+    def __init__(self, responses: List[DummyResponse], calls: List[Dict[str, Any]]) -> None:
+        self._responses = responses
+        self._calls = calls
+
+    def __enter__(self) -> "DummyClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def post(self, url: str, json: Dict[str, Any], headers: Dict[str, str]) -> DummyResponse:
+        self._calls.append({"url": url, "json": json, "headers": headers})
+        if not self._responses:
+            raise AssertionError("Gateway called more times than expected")
+        return self._responses.pop(0)
 
 
 def test_auth_required() -> None:
@@ -81,6 +124,7 @@ def test_ingest_intent_creates_open_clarification_when_project_string_present() 
         "kind": "intent",
         "intent_type": "create_task",
         "fields": {"title": "Write the spec", "project": "John and Sagita"},
+        "request_id": "req-clarify-001",
     }
     response = client.post("/v1/intents", json=payload, headers=headers)
 
@@ -117,6 +161,7 @@ def test_answer_clarification_by_choice_id_resumes_to_ready() -> None:
         "kind": "intent",
         "intent_type": "create_task",
         "fields": {"title": "Ship this", "project": "John and Sagita"},
+        "request_id": "req-clarify-002",
     }
     response = client.post("/v1/intents", json=payload, headers=headers)
     clarification_id = response.json()["clarification"]["clarification_id"]
@@ -203,6 +248,7 @@ def test_idempotent_clarification_answer_returns_ready() -> None:
         "kind": "intent",
         "intent_type": "create_task",
         "fields": {"title": "Ship this", "project": "John and Sagita"},
+        "request_id": "req-clarify-003",
     }
     response = client.post("/v1/intents", json=payload, headers=headers)
     clarification_id = response.json()["clarification"]["clarification_id"]
@@ -230,11 +276,15 @@ def test_expired_clarification_is_removed() -> None:
     app = create_app(settings)
     client = TestClient(app)
 
-    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    headers = {
+        "Authorization": f"Bearer {settings.intent_service_token}",
+        "X-Actor-Id": "actor-expire-1",
+    }
     payload = {
         "kind": "intent",
         "intent_type": "create_task",
         "fields": {"title": "Old task", "project": "John and Sagita"},
+        "request_id": "req-clarify-004",
     }
     response = client.post("/v1/intents", json=payload, headers=headers)
     intent_id = response.json()["intent_id"]
@@ -317,3 +367,162 @@ def test_update_task_ready_returns_patch_payload() -> None:
     assert action["action"] == "notion.tasks.update"
     assert action["payload"]["notion_page_id"] == "task_123"
     assert action["payload"]["patch"]["status"] == "In Progress"
+
+
+def test_execute_actions_happy_path_persists_artifacts(monkeypatch) -> None:
+    settings = build_settings(
+        execute_actions=True,
+        gateway_base_url="http://gateway",
+        gateway_bearer_token="token",
+    )
+    responses = [
+        DummyResponse(
+            200,
+            json_data={
+                "request_id": "req-1",
+                "status": "ok",
+                "data": {"notion_page_id": "notion_123"},
+            },
+            text='{"status":"ok"}',
+        )
+    ]
+    calls: List[Dict[str, Any]] = []
+
+    def client_factory(*args: Any, **kwargs: Any) -> DummyClient:
+        return DummyClient(responses, calls)
+
+    monkeypatch.setattr(main.httpx, "Client", client_factory)
+
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {
+        "Authorization": f"Bearer {settings.intent_service_token}",
+        "X-Actor-Id": "actor-expire-1",
+    }
+    payload = {
+        "kind": "intent",
+        "intent_type": "create_task",
+        "fields": {"title": "Ship this"},
+        "request_id": "req-1",
+    }
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ready"
+    assert data["details"]["notion_task_id"] == "notion_123"
+    assert data["details"]["request_id"] == "req-1"
+    assert len(calls) == 1
+
+    engine = sa.create_engine(settings.database_url, future=True)
+    with engine.connect() as conn:
+        action_count = conn.execute(
+            sa.text(
+                "SELECT count(*) FROM intent_artifacts WHERE intent_id = :intent_id AND kind = 'action'"
+            ),
+            {"intent_id": data["intent_id"]},
+        ).scalar_one()
+        executed_count = conn.execute(
+            sa.text(
+                "SELECT count(*) FROM intent_artifacts WHERE intent_id = :intent_id AND status = 'executed'"
+            ),
+            {"intent_id": data["intent_id"]},
+        ).scalar_one()
+
+    assert action_count >= 1
+    assert executed_count >= 1
+
+
+def test_execution_idempotency_skips_gateway(monkeypatch) -> None:
+    settings = build_settings(
+        execute_actions=True,
+        gateway_base_url="http://gateway",
+        gateway_bearer_token="token",
+    )
+    responses = [
+        DummyResponse(
+            200,
+            json_data={
+                "request_id": "req-dup",
+                "status": "ok",
+                "data": {"notion_page_id": "notion_dup"},
+            },
+            text='{"status":"ok"}',
+        )
+    ]
+    calls: List[Dict[str, Any]] = []
+
+    def client_factory(*args: Any, **kwargs: Any) -> DummyClient:
+        return DummyClient(responses, calls)
+
+    monkeypatch.setattr(main.httpx, "Client", client_factory)
+
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {
+        "Authorization": f"Bearer {settings.intent_service_token}",
+        "X-Actor-Id": "actor-expire-1",
+    }
+    payload = {
+        "kind": "intent",
+        "intent_type": "create_task",
+        "fields": {"title": "Do the thing"},
+        "request_id": "req-dup",
+    }
+
+    first = client.post("/v1/intents", json=payload, headers=headers)
+    second = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["details"]["notion_task_id"] == "notion_dup"
+    assert second.json()["details"]["notion_task_id"] == "notion_dup"
+    assert len(calls) == 1
+
+
+def test_execute_actions_failure_returns_error(monkeypatch) -> None:
+    settings = build_settings(
+        execute_actions=True,
+        gateway_base_url="http://gateway",
+        gateway_bearer_token="token",
+    )
+    responses = [
+        DummyResponse(
+            500,
+            json_data={
+                "request_id": "req-fail",
+                "status": "error",
+                "error": {"code": "tasks_create_failed", "message": "boom"},
+            },
+            text='{"status":"error"}',
+        )
+    ]
+    calls: List[Dict[str, Any]] = []
+
+    def client_factory(*args: Any, **kwargs: Any) -> DummyClient:
+        return DummyClient(responses, calls)
+
+    monkeypatch.setattr(main.httpx, "Client", client_factory)
+
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {
+        "Authorization": f"Bearer {settings.intent_service_token}",
+        "X-Actor-Id": "actor-expire-1",
+    }
+    payload = {
+        "kind": "intent",
+        "intent_type": "create_task",
+        "fields": {"title": "Fail this"},
+        "request_id": "req-fail",
+    }
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "rejected"
+    assert data["error"]["code"] == "tasks_create_failed"
+    assert data["error"]["details"]["status_code"] == 500
+    assert len(calls) == 1

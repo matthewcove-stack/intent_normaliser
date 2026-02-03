@@ -1,6 +1,6 @@
 # Intent Normaliser Service
 
-FastAPI service for intent ingestion, normalization, clarification handling, and append-only artifact persistence. Action execution is still a stub.
+FastAPI service for intent ingestion, normalization, clarification handling, and append-only artifact persistence. Action execution for intents is available when `EXECUTE_ACTIONS=true` and gateway credentials are set.
 
 ## Workspace
 
@@ -57,7 +57,7 @@ Requires bearer auth. Writes a `received` artifact row, normalizes the intent, a
 
 - `ready` with a plan
 - `needs_clarification` with a clarification payload
-- `rejected` with an error code
+- `rejected` with an error object (`error.code`, `error.message`, `error.details`)
 
 Additional artifacts are written for each outcome.
 
@@ -67,7 +67,7 @@ Requires bearer auth. Returns the current intent status and latest plan/clarific
 
 ### POST /v1/actions
 
-Requires bearer auth. Writes a `received` artifact row and returns `accepted`. Execution is not implemented yet.
+Requires bearer auth. Writes a `received` artifact row and returns `accepted`. Execution is not implemented yet for action packets.
 
 ### GET /v1/clarifications?status=open
 

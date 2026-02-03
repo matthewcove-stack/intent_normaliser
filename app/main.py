@@ -31,6 +31,7 @@ from app.storage.db import (
     create_db_engine,
     expire_clarification,
     get_clarification,
+    get_latest_intent_artifact,
     get_intent,
     get_open_clarification_for_intent,
     insert_intent_artifact,
@@ -44,6 +45,21 @@ from app.util.ids import new_correlation_id, new_intent_id
 
 
 NOT_IMPLEMENTED_MESSAGE = "Phase 0: normalisation and execution are not implemented"
+
+
+def build_error_payload(
+    code: str,
+    message: str,
+    status_code: int | None = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload = {"code": code, "message": message}
+    if status_code is not None or details:
+        detail_payload = dict(details or {})
+        if status_code is not None:
+            detail_payload.setdefault("status_code", status_code)
+        payload["details"] = detail_payload
+    return payload
 
 
 def create_app(app_settings: Settings | None = None) -> FastAPI:
@@ -123,12 +139,20 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
     def compute_idempotency_key(packet: Dict[str, Any]) -> str:
         return f"intent:{sha256_hex(canonical_json(packet))}"
 
+    def compute_request_id(packet: Dict[str, Any]) -> tuple[str, bool]:
+        for key in ("request_id", "requestId"):
+            value = packet.get(key)
+            if value:
+                return str(value), True
+        return f"intent:{sha256_hex(canonical_json(packet))}", False
+
     def compute_action_idempotency_key(action: str, payload: Dict[str, Any]) -> str:
         return f"action:{sha256_hex(canonical_json({'action': action, 'payload': payload}))}"
 
     def build_gateway_request(
         action_packet: ActionPacket,
         actor_id: Optional[str],
+        request_id: Optional[str],
         settings: Settings,
     ) -> tuple[str, Dict[str, Any]]:
         action_name = action_packet.action or ""
@@ -144,8 +168,9 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         else:
             raise ValueError(f"Unsupported action: {action_name}")
         idempotency_key = action_packet.idempotency_key or compute_action_idempotency_key(action_name, payload)
+        request_value = request_id or str(uuid.uuid4())
         envelope = {
-            "request_id": str(uuid.uuid4()),
+            "request_id": request_value,
             "idempotency_key": idempotency_key,
             "actor": actor_id or "intent_normaliser",
             "payload": gateway_payload,
@@ -156,6 +181,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         intent_id: str,
         correlation_id: str,
         actor_id: Optional[str],
+        request_id: Optional[str],
         plan: Plan,
         settings: Settings,
     ) -> tuple[bool, list[Dict[str, Any]]]:
@@ -169,17 +195,39 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 action_name = action.action or ""
                 success = False
                 response_body = None
+                response_json: Optional[Dict[str, Any]] = None
                 status_code = None
                 error_message = None
+                error_code = None
+                notion_task_id = None
                 request_envelope: Dict[str, Any] = {}
                 endpoint = ""
                 try:
-                    endpoint, request_envelope = build_gateway_request(action, actor_id, settings)
+                    endpoint, request_envelope = build_gateway_request(action, actor_id, request_id, settings)
                     url = f"{base_url}{endpoint}"
                     response = client.post(url, json=request_envelope, headers=headers)
                     status_code = response.status_code
                     response_body = response.text
-                    success = response.status_code == 200
+                    try:
+                        response_json = response.json()
+                    except ValueError:
+                        response_json = None
+                    success = 200 <= response.status_code < 300
+                    if response_json:
+                        error_payload = response_json.get("error") if isinstance(response_json, dict) else None
+                        if error_payload:
+                            error_code = error_payload.get("code") or error_payload.get("type")
+                            error_message = error_payload.get("message") or error_message
+                            success = False
+                        data_payload = response_json.get("data") if isinstance(response_json, dict) else None
+                        if isinstance(data_payload, dict):
+                            notion_task_id = (
+                                data_payload.get("notion_page_id")
+                                or data_payload.get("notion_task_id")
+                                or data_payload.get("page_id")
+                            )
+                        if isinstance(response_json, dict) and response_json.get("status") == "error":
+                            success = False
                 except Exception as exc:
                     error_message = str(exc)
 
@@ -191,7 +239,10 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                     "status_code": status_code,
                     "success": success,
                     "response_body": response_body,
+                    "response_json": response_json,
+                    "error_code": error_code,
                     "error": error_message,
+                    "notion_task_id": notion_task_id,
                 }
                 results.append(result)
 
@@ -201,7 +252,9 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                         "response": {
                             "status_code": status_code,
                             "body": response_body,
+                            "json": response_json,
                             "error": error_message,
+                            "error_code": error_code,
                         },
                         "success": success,
                     },
@@ -283,6 +336,11 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 correlation_id=correlation_id,
                 error_code="REJECTED",
                 message="Intent rejected",
+                error=build_error_payload(
+                    "INTENT_FAILED",
+                    "Intent rejected",
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                ),
             )
         return IngestResponse(
             status="accepted",
@@ -290,6 +348,33 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             correlation_id=correlation_id,
             message="Intent accepted",
         )
+
+    def attach_request_id(response_payload: IngestResponse, request_id: str) -> None:
+        details = dict(response_payload.details or {})
+        details.setdefault("request_id", request_id)
+        response_payload.details = details
+
+    def load_outcome_response(intent_id: str) -> Optional[IngestResponse]:
+        artifact = get_latest_intent_artifact(
+            app.state.engine,
+            intent_id=intent_id,
+            kind="intent",
+            status="executed",
+        )
+        if not artifact:
+            artifact = get_latest_intent_artifact(
+                app.state.engine,
+                intent_id=intent_id,
+                kind="intent",
+                status="failed",
+            )
+        if not artifact:
+            return None
+        payload = artifact.get("artifact") or {}
+        try:
+            return IngestResponse.model_validate(payload)
+        except Exception:
+            return None
 
     @app.get("/health")
     def health() -> Dict[str, str]:
@@ -316,7 +401,12 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         x_actor_id: str | None = Header(default=None, alias="X-Actor-Id"),
     ) -> IngestResponse:
         packet_data = packet.model_dump(mode="json", exclude_none=True)
-        idempotency_key = compute_idempotency_key(packet_data)
+        request_id, request_id_provided = compute_request_id(packet_data)
+        if request_id_provided:
+            idempotency_key = f"request:{request_id}"
+        else:
+            idempotency_key = compute_idempotency_key(packet_data)
+        packet_data["request_id"] = request_id
         intent_id = packet.intent_id or new_intent_id()
         correlation_id = packet.correlation_id or new_correlation_id()
         actor_id = x_actor_id or packet_data.get("actor_id")
@@ -360,8 +450,12 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
 
         response.headers["X-Intent-Id"] = intent_id
         response.headers["X-Correlation-Id"] = correlation_id
+        response.headers["X-Request-Id"] = request_id
 
         if not created:
+            outcome = load_outcome_response(intent_id)
+            if outcome:
+                return outcome
             clarification_row = None
             if intent_row["status"] == "needs_clarification":
                 clarification_row = get_open_clarification_for_intent(
@@ -371,6 +465,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                     expiry_hours=settings.clarification_expiry_hours,
                 )
             response_payload = outcome_response_from_intent(intent_row, clarification_row)
+            attach_request_id(response_payload, request_id)
             try:
                 persist_artifact(
                     packet=response_payload.model_dump(mode="json", exclude_none=True),
@@ -420,6 +515,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 correlation_id=correlation_id,
                 clarification=clarification_payload,
             )
+            attach_request_id(response_payload, request_id)
             persist_artifact(
                 packet={
                     "status": "needs_clarification",
@@ -458,6 +554,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                         intent_id=intent_id,
                         correlation_id=correlation_id,
                         actor_id=actor_id,
+                        request_id=request_id,
                         plan=plan,
                         settings=settings,
                     )
@@ -470,7 +567,13 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                         details={"execution_results": []},
                         intent_id=intent_id,
                         correlation_id=correlation_id,
+                        error=build_error_payload(
+                            "EXECUTION_NOT_CONFIGURED",
+                            str(exc),
+                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        ),
                     )
+                    attach_request_id(response_payload, request_id)
                     persist_artifact(
                         packet=response_payload.model_dump(mode="json", exclude_none=True),
                         kind="intent",
@@ -486,6 +589,22 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
 
                 if not all_success:
                     update_intent(app.state.engine, intent_id=intent_id, status="failed")
+                    failure = next((item for item in execution_results if not item["success"]), None)
+                    error_code = failure.get("error_code") if failure else None
+                    if failure:
+                        error_message = failure.get("error") or "One or more actions failed"
+                        status_code = failure.get("status_code") or status.HTTP_502_BAD_GATEWAY
+                    else:
+                        error_message = "Execution failed"
+                        status_code = status.HTTP_502_BAD_GATEWAY
+                    error_details = {}
+                    if failure:
+                        error_details = {
+                            "status_code": status_code,
+                            "endpoint": failure.get("endpoint"),
+                            "request_id": failure.get("request_id"),
+                            "idempotency_key": failure.get("idempotency_key"),
+                        }
                     response_payload = IngestResponse(
                         status="rejected",
                         error_code="EXECUTION_FAILED",
@@ -493,7 +612,14 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                         details={"execution_results": execution_results},
                         intent_id=intent_id,
                         correlation_id=correlation_id,
+                        error=build_error_payload(
+                            error_code or "EXECUTION_FAILED",
+                            error_message,
+                            status_code=status_code,
+                            details=error_details,
+                        ),
                     )
+                    attach_request_id(response_payload, request_id)
                     persist_artifact(
                         packet=response_payload.model_dump(mode="json", exclude_none=True),
                         kind="intent",
@@ -507,12 +633,18 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                     )
                     return response_payload
 
-                response_payload.details = {"execution_results": execution_results}
+                notion_task_id = None
+                for item in execution_results:
+                    if item.get("notion_task_id"):
+                        notion_task_id = item["notion_task_id"]
+                        break
+                response_payload.details = {
+                    "execution_results": execution_results,
+                    "notion_task_id": notion_task_id,
+                    "request_id": request_id,
+                }
                 persist_artifact(
-                    packet={
-                        "status": "executed",
-                        "execution_results": execution_results,
-                    },
+                    packet=response_payload.model_dump(mode="json", exclude_none=True),
                     kind="intent",
                     intent_type=packet.intent_type,
                     action=None,
@@ -522,6 +654,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                     idempotency_key=idempotency_key,
                     settings=settings,
                 )
+            attach_request_id(response_payload, request_id)
             persist_artifact(
                 packet={
                     "status": "ready",
@@ -547,7 +680,13 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             details=result.details,
             intent_id=intent_id,
             correlation_id=correlation_id,
+            error=build_error_payload(
+                result.error_code or "REJECTED",
+                result.message or "Intent rejected",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            ),
         )
+        attach_request_id(response_payload, request_id)
         persist_artifact(
             packet=response_payload.model_dump(mode="json", exclude_none=True),
             kind="intent",
@@ -598,6 +737,11 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 message="Missing action",
                 intent_id=intent_id,
                 correlation_id=correlation_id,
+                error=build_error_payload(
+                    "VALIDATION_ERROR",
+                    "Missing action",
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                ),
             )
         else:
             response_payload = IngestResponse(
@@ -802,6 +946,11 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             details=result.details,
             intent_id=intent_row["intent_id"],
             correlation_id=intent_row["correlation_id"],
+            error=build_error_payload(
+                result.error_code or "REJECTED",
+                result.message or "Intent rejected",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            ),
         )
         persist_artifact(
             packet=response_payload.model_dump(mode="json", exclude_none=True),

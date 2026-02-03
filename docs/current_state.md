@@ -2,13 +2,14 @@
 
 ## What works today
 - FastAPI service with Postgres persistence and Alembic migrations
-- `POST /v1/intents` normalises intent and persists artifacts
+- `POST /v1/intents` normalises intent, persists artifacts, and (when `EXECUTE_ACTIONS=true`) executes Notion task create/update via notion_gateway
+- Execution responses include `details.notion_task_id` and `details.request_id` on success; failures include `error.code`, `error.message`, and `error.details.status_code`
 - Clarification endpoints exist
 - Tests run in Docker (`pytest`)
 
 ## What is incomplete / risky
-- `POST /v1/actions` is a stub (execution not implemented) and must be completed for Phase 1
-- Execution/idempotency rules are not yet proven end-to-end against notion_gateway
+- `POST /v1/actions` is still a stub (Phase 2+)
+- End-to-end execution relies on correct gateway configuration (base URL + bearer token)
 
 ## Phase 1 scope (exact)
 
