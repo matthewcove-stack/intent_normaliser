@@ -312,6 +312,16 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         intent_status = intent_row["status"]
         intent_id = intent_row["intent_id"]
         correlation_id = intent_row["correlation_id"]
+        if intent_status in {"executed", "failed"}:
+            outcome = load_outcome_response(intent_id)
+            if outcome:
+                return outcome
+            return IngestResponse(
+                status=intent_status,
+                intent_id=intent_id,
+                correlation_id=correlation_id,
+                message="Intent completed" if intent_status == "executed" else "Intent failed",
+            )
         if intent_status == "needs_clarification":
             clarification = build_clarification_payload(clarification_row) if clarification_row else None
             return IngestResponse(
@@ -367,6 +377,13 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 intent_id=intent_id,
                 kind="intent",
                 status="failed",
+            )
+        if not artifact:
+            artifact = get_latest_intent_artifact(
+                app.state.engine,
+                intent_id=intent_id,
+                kind="intent",
+                status="rejected",
             )
         if not artifact:
             return None
@@ -561,7 +578,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 except ValueError as exc:
                     intent_row = update_intent(app.state.engine, intent_id=intent_id, status="failed")
                     response_payload = IngestResponse(
-                        status="rejected",
+                        status="failed",
                         error_code="EXECUTION_NOT_CONFIGURED",
                         message=str(exc),
                         details={"execution_results": []},
@@ -606,7 +623,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                             "idempotency_key": failure.get("idempotency_key"),
                         }
                     response_payload = IngestResponse(
-                        status="rejected",
+                        status="failed",
                         error_code="EXECUTION_FAILED",
                         message="One or more actions failed",
                         details={"execution_results": execution_results},
@@ -638,6 +655,8 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                     if item.get("notion_task_id"):
                         notion_task_id = item["notion_task_id"]
                         break
+                update_intent(app.state.engine, intent_id=intent_id, status="executed")
+                response_payload.status = "executed"
                 response_payload.details = {
                     "execution_results": execution_results,
                     "notion_task_id": notion_task_id,

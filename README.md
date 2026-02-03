@@ -55,7 +55,9 @@ Returns `{ "version", "git_sha", "artifact_version" }`.
 
 Requires bearer auth. Writes a `received` artifact row, normalizes the intent, and returns one of:
 
-- `ready` with a plan
+- `ready` with a plan (when `EXECUTE_ACTIONS=false`)
+- `executed` with `details.notion_task_id` and `details.request_id` (when execution succeeds)
+- `failed` with an error object (`error.code`, `error.message`, `error.details`) (when execution fails)
 - `needs_clarification` with a clarification payload
 - `rejected` with an error object (`error.code`, `error.message`, `error.details`)
 

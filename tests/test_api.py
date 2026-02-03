@@ -410,7 +410,7 @@ def test_execute_actions_happy_path_persists_artifacts(monkeypatch) -> None:
 
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "ready"
+    assert data["status"] == "executed"
     assert data["details"]["notion_task_id"] == "notion_123"
     assert data["details"]["request_id"] == "req-1"
     assert len(calls) == 1
@@ -476,6 +476,8 @@ def test_execution_idempotency_skips_gateway(monkeypatch) -> None:
 
     assert first.status_code == 200
     assert second.status_code == 200
+    assert first.json()["status"] == "executed"
+    assert second.json()["status"] == "executed"
     assert first.json()["details"]["notion_task_id"] == "notion_dup"
     assert second.json()["details"]["notion_task_id"] == "notion_dup"
     assert len(calls) == 1
@@ -522,7 +524,7 @@ def test_execute_actions_failure_returns_error(monkeypatch) -> None:
 
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "rejected"
+    assert data["status"] == "failed"
     assert data["error"]["code"] == "tasks_create_failed"
     assert data["error"]["details"]["status_code"] == 500
     assert len(calls) == 1

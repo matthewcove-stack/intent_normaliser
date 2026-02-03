@@ -3,7 +3,7 @@
 ## What works today
 - FastAPI service with Postgres persistence and Alembic migrations
 - `POST /v1/intents` normalises intent, persists artifacts, and (when `EXECUTE_ACTIONS=true`) executes Notion task create/update via notion_gateway
-- Execution responses include `details.notion_task_id` and `details.request_id` on success; failures include `error.code`, `error.message`, and `error.details.status_code`
+- Execution responses return `status=executed` with `details.notion_task_id` and `details.request_id`; failures return `status=failed` with `error.code`, `error.message`, and `error.details.status_code`
 - Clarification endpoints exist
 - Tests run in Docker (`pytest`)
 

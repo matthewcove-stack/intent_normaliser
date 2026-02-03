@@ -62,7 +62,7 @@ class ClarificationAnswerRequest(BaseModel):
 
 
 class IngestResponse(BaseModel):
-    status: Literal["ready", "needs_clarification", "rejected", "accepted"]
+    status: Literal["ready", "needs_clarification", "rejected", "accepted", "executed", "failed"]
     intent_id: str
     correlation_id: str
     plan: Optional[Plan] = None
