@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0002_allow_multiple_artifacts_per_intent"
+revision = "0002_allow_multi_artifacts"
 down_revision = "0001_create_intent_artifacts"
 branch_labels = None
 depends_on = None

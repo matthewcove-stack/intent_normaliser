@@ -3,8 +3,8 @@ from __future__ import annotations
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0004_add_actor_id_to_intents_clarifications"
-down_revision = "0003_add_intents_and_clarifications"
+revision = "0004_add_actor_id_intents"
+down_revision = "0003_add_intents_clarifications"
 branch_labels = None
 depends_on = None
 

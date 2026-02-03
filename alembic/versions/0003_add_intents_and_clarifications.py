@@ -4,8 +4,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-revision = "0003_add_intents_and_clarifications"
-down_revision = "0002_allow_multiple_artifacts_per_intent"
+revision = "0003_add_intents_clarifications"
+down_revision = "0002_allow_multi_artifacts"
 branch_labels = None
 depends_on = None
 

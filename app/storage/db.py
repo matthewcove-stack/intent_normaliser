@@ -256,3 +256,21 @@ def insert_intent_artifact(engine: Engine, payload: Dict[str, Any]) -> None:
             conn.execute(intent_artifacts.insert().values(**payload))
     except SQLAlchemyError as exc:
         raise exc
+
+
+def get_latest_intent_artifact(
+    engine: Engine,
+    *,
+    intent_id: str,
+    kind: Optional[str] = None,
+    status: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    stmt = select(intent_artifacts).where(intent_artifacts.c.intent_id == intent_id)
+    if kind is not None:
+        stmt = stmt.where(intent_artifacts.c.kind == kind)
+    if status is not None:
+        stmt = stmt.where(intent_artifacts.c.status == status)
+    stmt = stmt.order_by(intent_artifacts.c.received_at.desc())
+    with engine.begin() as conn:
+        row = conn.execute(stmt).mappings().first()
+        return dict(row) if row else None
