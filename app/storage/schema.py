@@ -19,6 +19,8 @@ intents = Table(
     Column("canonical_draft", JSONB, nullable=True),
     Column("final_canonical", JSONB, nullable=True),
     Column("correlation_id", Text, nullable=False),
+    Column("trace_id", Text, nullable=False, server_default=text("gen_random_uuid()::text")),
+    Column("response_envelope_json", JSONB, nullable=True),
     Index("ix_intents_status", "status"),
     Index("ix_intents_idempotency_key", "idempotency_key"),
     Index("ix_intents_actor_id", "actor_id"),

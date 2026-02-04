@@ -3,6 +3,8 @@
 ## What works today
 - FastAPI service with Postgres persistence and Alembic migrations
 - `POST /v1/intents` normalises intent, persists artifacts, and (when `EXECUTE_ACTIONS=true`) executes Notion task create/update via notion_gateway
+- `POST /v1/intents` computes a server-side `idempotency_key` from canonical JSON, persists first, and returns a receipt envelope that always includes `receipt_id`, `trace_id`, and `idempotency_key`
+- Duplicate ingest requests (same canonical payload) return the original receipt and skip downstream execution
 - Execution responses return `status=executed` with `details.notion_task_id` and `details.request_id`; failures return `status=failed` with `error.code`, `error.message`, and `error.details.status_code`
 - Clarification endpoints exist
 - Tests run in Docker (`pytest`)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Dict, List
 
@@ -11,6 +12,8 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 import app.main as main
 from app.main import create_app
+from app.normalization import NormalizationResult
+from app.util.idempotency import compute_idempotency_key
 
 
 def build_settings(**overrides: Any) -> Settings:
@@ -30,6 +33,12 @@ def build_settings(**overrides: Any) -> Settings:
     }
     values.update(overrides)
     return Settings(**values)
+
+
+def assert_receipt_fields(payload: Dict[str, Any]) -> None:
+    assert payload["receipt_id"]
+    assert payload["trace_id"]
+    assert payload["idempotency_key"]
 
 
 @pytest.fixture(autouse=True)
@@ -89,6 +98,7 @@ def test_ingest_writes_artifact_row() -> None:
 
     assert response.status_code == 200
     data = response.json()
+    assert_receipt_fields(data)
     intent_id = data["intent_id"]
 
     engine = sa.create_engine(settings.database_url, future=True)
@@ -225,6 +235,7 @@ def test_idempotent_repost_returns_same_intent() -> None:
     intent_id_one = response_one.json()["intent_id"]
     intent_id_two = response_two.json()["intent_id"]
     assert intent_id_one == intent_id_two
+    assert response_one.json()["receipt_id"] == response_two.json()["receipt_id"]
 
     engine = sa.create_engine(settings.database_url, future=True)
     with engine.connect() as conn:
@@ -410,6 +421,7 @@ def test_execute_actions_happy_path_persists_artifacts(monkeypatch) -> None:
 
     assert response.status_code == 200
     data = response.json()
+    assert_receipt_fields(data)
     assert data["status"] == "executed"
     assert data["details"]["notion_task_id"] == "notion_123"
     assert data["details"]["request_id"] == "req-1"
@@ -480,6 +492,8 @@ def test_execution_idempotency_skips_gateway(monkeypatch) -> None:
     assert second.json()["status"] == "executed"
     assert first.json()["details"]["notion_task_id"] == "notion_dup"
     assert second.json()["details"]["notion_task_id"] == "notion_dup"
+    assert first.json()["receipt_id"] == second.json()["receipt_id"]
+    assert first.json()["idempotency_key"] == second.json()["idempotency_key"]
     assert len(calls) == 1
 
 
@@ -524,7 +538,52 @@ def test_execute_actions_failure_returns_error(monkeypatch) -> None:
 
     assert response.status_code == 200
     data = response.json()
+    assert_receipt_fields(data)
     assert data["status"] == "failed"
     assert data["error"]["code"] == "tasks_create_failed"
     assert data["error"]["details"]["status_code"] == 500
     assert len(calls) == 1
+
+
+def test_idempotency_canonicalization_stable() -> None:
+    payload_one = json.loads('{"kind":"intent","natural_language":"Draft plan","fields":{"a":1,"b":2}}')
+    payload_two = json.loads(
+        '{ "fields": { "b": 2, "a": 1 }, "natural_language": "Draft plan", "kind": "intent" }'
+    )
+
+    key_one = compute_idempotency_key(payload_one)
+    key_two = compute_idempotency_key(payload_two)
+
+    assert key_one == key_two
+
+
+def test_persist_first_before_normalize(monkeypatch) -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+
+    calls: List[str] = []
+    original_upsert = main.upsert_intent_by_idempotency_key
+
+    def tracked_upsert(*args: Any, **kwargs: Any):
+        calls.append("persist")
+        return original_upsert(*args, **kwargs)
+
+    def fake_normalize(*args: Any, **kwargs: Any) -> NormalizationResult:
+        assert calls == ["persist"]
+        return NormalizationResult(
+            status="ready",
+            canonical_draft={"intent_type": "create_task", "fields": {"title": "Test"}},
+            final_canonical={"intent_type": "create_task", "fields": {"title": "Test"}},
+        )
+
+    monkeypatch.setattr(main, "upsert_intent_by_idempotency_key", tracked_upsert)
+    monkeypatch.setattr(main, "normalize_intent", fake_normalize)
+
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {"kind": "intent", "intent_type": "create_task", "fields": {"title": "Test"}}
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    assert calls == ["persist"]

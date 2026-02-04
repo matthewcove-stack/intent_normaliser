@@ -65,6 +65,9 @@ class IngestResponse(BaseModel):
     status: Literal["ready", "needs_clarification", "rejected", "accepted", "executed", "failed"]
     intent_id: str
     correlation_id: str
+    receipt_id: Optional[str] = None
+    trace_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
     plan: Optional[Plan] = None
     clarification: Optional[Clarification] = None
     error_code: Optional[str] = None

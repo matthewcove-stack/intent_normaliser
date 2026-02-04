@@ -27,9 +27,11 @@ def upsert_intent_by_idempotency_key(
     status: str,
     raw_packet: Dict[str, Any],
     correlation_id: str,
+    trace_id: str,
     actor_id: Optional[str] = None,
     canonical_draft: Optional[Dict[str, Any]] = None,
     final_canonical: Optional[Dict[str, Any]] = None,
+    response_envelope_json: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], bool]:
     stmt = (
         pg_insert(intents)
@@ -42,6 +44,8 @@ def upsert_intent_by_idempotency_key(
             canonical_draft=canonical_draft,
             final_canonical=final_canonical,
             correlation_id=correlation_id,
+            trace_id=trace_id,
+            response_envelope_json=response_envelope_json,
         )
         .on_conflict_do_nothing(index_elements=["idempotency_key"])
         .returning(*intents.c)
@@ -58,6 +62,8 @@ def upsert_intent_by_idempotency_key(
         existing_dict = dict(existing)
         if actor_id and not existing_dict.get("actor_id"):
             existing_dict = update_intent(engine, intent_id=existing_dict["intent_id"], actor_id=actor_id)
+        if trace_id and not existing_dict.get("trace_id"):
+            existing_dict = update_intent(engine, intent_id=existing_dict["intent_id"], trace_id=trace_id)
         return existing_dict, False
 
 
@@ -70,6 +76,8 @@ def update_intent(
     final_canonical: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
     actor_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    response_envelope_json: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     values: Dict[str, Any] = {"updated_at": text("now()")}
     if status is not None:
@@ -82,6 +90,10 @@ def update_intent(
         values["correlation_id"] = correlation_id
     if actor_id is not None:
         values["actor_id"] = actor_id
+    if trace_id is not None:
+        values["trace_id"] = trace_id
+    if response_envelope_json is not None:
+        values["response_envelope_json"] = response_envelope_json
     stmt = (
         update(intents)
         .where(intents.c.intent_id == intent_id)

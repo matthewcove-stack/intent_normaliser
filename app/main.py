@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
+import json
+import logging
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 import httpx
+from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import Settings, settings as default_settings
@@ -41,10 +45,13 @@ from app.storage.db import (
 )
 from app.util.canonical import canonical_json
 from app.util.hashing import sha256_hex
-from app.util.ids import new_correlation_id, new_intent_id
+from app.util.idempotency import compute_idempotency_key
+from app.util.ids import new_correlation_id, new_intent_id, new_trace_id
 
 
 NOT_IMPLEMENTED_MESSAGE = "Phase 0: normalisation and execution are not implemented"
+
+logger = logging.getLogger("intent_normaliser")
 
 
 def build_error_payload(
@@ -60,6 +67,19 @@ def build_error_payload(
             detail_payload.setdefault("status_code", status_code)
         payload["details"] = detail_payload
     return payload
+
+
+def build_error_response(
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": build_error_payload(code, message, status_code=status_code, details=details)},
+    )
 
 
 def create_app(app_settings: Settings | None = None) -> FastAPI:
@@ -136,15 +156,12 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         except SQLAlchemyError:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unavailable")
 
-    def compute_idempotency_key(packet: Dict[str, Any]) -> str:
-        return f"intent:{sha256_hex(canonical_json(packet))}"
-
-    def compute_request_id(packet: Dict[str, Any]) -> tuple[str, bool]:
+    def compute_request_id(packet: Dict[str, Any], idempotency_key: str) -> tuple[str, bool]:
         for key in ("request_id", "requestId"):
             value = packet.get(key)
             if value:
                 return str(value), True
-        return f"intent:{sha256_hex(canonical_json(packet))}", False
+        return f"intent:{idempotency_key}", False
 
     def compute_action_idempotency_key(action: str, payload: Dict[str, Any]) -> str:
         return f"action:{sha256_hex(canonical_json({'action': action, 'payload': payload}))}"
@@ -364,6 +381,27 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         details.setdefault("request_id", request_id)
         response_payload.details = details
 
+    def attach_receipt_fields(
+        response_payload: IngestResponse,
+        *,
+        intent_id: str,
+        trace_id: str,
+        idempotency_key: str,
+        overwrite: bool = True,
+    ) -> None:
+        if overwrite or response_payload.receipt_id is None:
+            response_payload.receipt_id = intent_id
+        if overwrite or response_payload.trace_id is None:
+            response_payload.trace_id = trace_id
+        if overwrite or response_payload.idempotency_key is None:
+            response_payload.idempotency_key = idempotency_key
+
+    def response_from_envelope(envelope: Dict[str, Any]) -> Optional[IngestResponse]:
+        try:
+            return IngestResponse.model_validate(envelope)
+        except ValidationError:
+            return None
+
     def load_outcome_response(intent_id: str) -> Optional[IngestResponse]:
         artifact = get_latest_intent_artifact(
             app.state.engine,
@@ -410,25 +448,58 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         }
 
     @app.post("/v1/intents", response_model=IngestResponse)
-    def ingest_intent(
-        packet: IntentPacket,
+    async def ingest_intent(
+        request: Request,
         response: Response,
         _: None = Depends(require_bearer),
         settings: Settings = Depends(get_settings),
         x_actor_id: str | None = Header(default=None, alias="X-Actor-Id"),
     ) -> IngestResponse:
+        try:
+            payload = json.loads(await request.body())
+        except json.JSONDecodeError:
+            return build_error_response(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                code="bad_json",
+                message="Invalid JSON payload",
+            )
+
+        if not isinstance(payload, dict):
+            return build_error_response(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                code="schema_validation_failed",
+                message="Intent payload must be a JSON object",
+            )
+
+        schema_version = payload.get("schema_version")
+        if schema_version and schema_version != "v1":
+            return build_error_response(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                code="unsupported_schema_version",
+                message=f"Unsupported schema_version: {schema_version}",
+            )
+
+        try:
+            packet = IntentPacket.model_validate(payload)
+        except ValidationError as exc:
+            return build_error_response(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                code="schema_validation_failed",
+                message="Intent payload failed schema validation",
+                details={"errors": exc.errors()},
+            )
+
+        idempotency_key = compute_idempotency_key(payload)
+        request_id, _ = compute_request_id(payload, idempotency_key)
         packet_data = packet.model_dump(mode="json", exclude_none=True)
-        request_id, request_id_provided = compute_request_id(packet_data)
-        if request_id_provided:
-            idempotency_key = f"request:{request_id}"
-        else:
-            idempotency_key = compute_idempotency_key(packet_data)
         packet_data["request_id"] = request_id
         intent_id = packet.intent_id or new_intent_id()
         correlation_id = packet.correlation_id or new_correlation_id()
+        trace_id = new_trace_id()
         actor_id = x_actor_id or packet_data.get("actor_id")
         packet_data["intent_id"] = intent_id
         packet_data["correlation_id"] = correlation_id
+        packet_data["trace_id"] = trace_id
         if actor_id:
             packet_data["actor_id"] = actor_id
 
@@ -438,8 +509,9 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 intent_id=intent_id,
                 idempotency_key=idempotency_key,
                 status="received",
-                raw_packet=packet_data,
+                raw_packet=payload,
                 correlation_id=correlation_id,
+                trace_id=trace_id,
                 actor_id=actor_id,
             )
         except SQLAlchemyError:
@@ -447,8 +519,10 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
 
         intent_id = intent_row["intent_id"]
         correlation_id = intent_row["correlation_id"]
+        trace_id = intent_row.get("trace_id") or trace_id
         packet_data["intent_id"] = intent_id
         packet_data["correlation_id"] = correlation_id
+        packet_data["trace_id"] = trace_id
 
         try:
             persist_artifact(
@@ -468,10 +542,36 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         response.headers["X-Intent-Id"] = intent_id
         response.headers["X-Correlation-Id"] = correlation_id
         response.headers["X-Request-Id"] = request_id
+        response.headers["X-Trace-Id"] = trace_id
+
+        logger.info(
+            "intent_ingest_received receipt_id=%s trace_id=%s idempotency_key=%s",
+            intent_id,
+            trace_id,
+            idempotency_key,
+        )
 
         if not created:
+            stored_envelope = intent_row.get("response_envelope_json")
+            if stored_envelope:
+                stored_response = response_from_envelope(stored_envelope)
+                if stored_response:
+                    attach_receipt_fields(
+                        stored_response,
+                        intent_id=intent_id,
+                        trace_id=trace_id,
+                        idempotency_key=idempotency_key,
+                        overwrite=False,
+                    )
+                    return stored_response
             outcome = load_outcome_response(intent_id)
             if outcome:
+                attach_receipt_fields(
+                    outcome,
+                    intent_id=intent_id,
+                    trace_id=trace_id,
+                    idempotency_key=idempotency_key,
+                )
                 return outcome
             clarification_row = None
             if intent_row["status"] == "needs_clarification":
@@ -483,6 +583,12 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 )
             response_payload = outcome_response_from_intent(intent_row, clarification_row)
             attach_request_id(response_payload, request_id)
+            attach_receipt_fields(
+                response_payload,
+                intent_id=intent_id,
+                trace_id=trace_id,
+                idempotency_key=idempotency_key,
+            )
             try:
                 persist_artifact(
                     packet=response_payload.model_dump(mode="json", exclude_none=True),
@@ -495,8 +601,20 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                     idempotency_key=idempotency_key,
                     settings=settings,
                 )
+                update_intent(
+                    app.state.engine,
+                    intent_id=intent_id,
+                    response_envelope_json=response_payload.model_dump(mode="json", exclude_none=True),
+                )
             except SQLAlchemyError:
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unavailable")
+            logger.info(
+                "intent_ingest_duplicate receipt_id=%s trace_id=%s idempotency_key=%s status=%s",
+                intent_id,
+                trace_id,
+                idempotency_key,
+                response_payload.status,
+            )
             return response_payload
 
         result = normalize_intent(
@@ -533,6 +651,12 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 clarification=clarification_payload,
             )
             attach_request_id(response_payload, request_id)
+            attach_receipt_fields(
+                response_payload,
+                intent_id=intent_id,
+                trace_id=trace_id,
+                idempotency_key=idempotency_key,
+            )
             persist_artifact(
                 packet={
                     "status": "needs_clarification",
@@ -547,6 +671,11 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 status="needs_clarification",
                 idempotency_key=idempotency_key,
                 settings=settings,
+            )
+            update_intent(
+                app.state.engine,
+                intent_id=intent_id,
+                response_envelope_json=response_payload.model_dump(mode="json", exclude_none=True),
             )
             return response_payload
 
@@ -591,6 +720,12 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                         ),
                     )
                     attach_request_id(response_payload, request_id)
+                    attach_receipt_fields(
+                        response_payload,
+                        intent_id=intent_id,
+                        trace_id=trace_id,
+                        idempotency_key=idempotency_key,
+                    )
                     persist_artifact(
                         packet=response_payload.model_dump(mode="json", exclude_none=True),
                         kind="intent",
@@ -601,6 +736,17 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                         status="failed",
                         idempotency_key=idempotency_key,
                         settings=settings,
+                    )
+                    update_intent(
+                        app.state.engine,
+                        intent_id=intent_id,
+                        response_envelope_json=response_payload.model_dump(mode="json", exclude_none=True),
+                    )
+                    logger.info(
+                        "intent_ingest_failed receipt_id=%s trace_id=%s idempotency_key=%s status=failed",
+                        intent_id,
+                        trace_id,
+                        idempotency_key,
                     )
                     return response_payload
 
@@ -637,6 +783,12 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                         ),
                     )
                     attach_request_id(response_payload, request_id)
+                    attach_receipt_fields(
+                        response_payload,
+                        intent_id=intent_id,
+                        trace_id=trace_id,
+                        idempotency_key=idempotency_key,
+                    )
                     persist_artifact(
                         packet=response_payload.model_dump(mode="json", exclude_none=True),
                         kind="intent",
@@ -647,6 +799,17 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                         status="failed",
                         idempotency_key=idempotency_key,
                         settings=settings,
+                    )
+                    update_intent(
+                        app.state.engine,
+                        intent_id=intent_id,
+                        response_envelope_json=response_payload.model_dump(mode="json", exclude_none=True),
+                    )
+                    logger.info(
+                        "intent_ingest_failed receipt_id=%s trace_id=%s idempotency_key=%s status=failed",
+                        intent_id,
+                        trace_id,
+                        idempotency_key,
                     )
                     return response_payload
 
@@ -662,6 +825,12 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                     "notion_task_id": notion_task_id,
                     "request_id": request_id,
                 }
+                attach_receipt_fields(
+                    response_payload,
+                    intent_id=intent_id,
+                    trace_id=trace_id,
+                    idempotency_key=idempotency_key,
+                )
                 persist_artifact(
                     packet=response_payload.model_dump(mode="json", exclude_none=True),
                     kind="intent",
@@ -673,7 +842,18 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                     idempotency_key=idempotency_key,
                     settings=settings,
                 )
+                update_intent(
+                    app.state.engine,
+                    intent_id=intent_id,
+                    response_envelope_json=response_payload.model_dump(mode="json", exclude_none=True),
+                )
             attach_request_id(response_payload, request_id)
+            attach_receipt_fields(
+                response_payload,
+                intent_id=intent_id,
+                trace_id=trace_id,
+                idempotency_key=idempotency_key,
+            )
             persist_artifact(
                 packet={
                     "status": "ready",
@@ -688,6 +868,18 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 status="ready",
                 idempotency_key=idempotency_key,
                 settings=settings,
+            )
+            update_intent(
+                app.state.engine,
+                intent_id=intent_id,
+                response_envelope_json=response_payload.model_dump(mode="json", exclude_none=True),
+            )
+            logger.info(
+                "intent_ingest_ready receipt_id=%s trace_id=%s idempotency_key=%s status=%s",
+                intent_id,
+                trace_id,
+                idempotency_key,
+                response_payload.status,
             )
             return response_payload
 
@@ -706,6 +898,12 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             ),
         )
         attach_request_id(response_payload, request_id)
+        attach_receipt_fields(
+            response_payload,
+            intent_id=intent_id,
+            trace_id=trace_id,
+            idempotency_key=idempotency_key,
+        )
         persist_artifact(
             packet=response_payload.model_dump(mode="json", exclude_none=True),
             kind="intent",
@@ -716,6 +914,17 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             status="rejected",
             idempotency_key=idempotency_key,
             settings=settings,
+        )
+        update_intent(
+            app.state.engine,
+            intent_id=intent_id,
+            response_envelope_json=response_payload.model_dump(mode="json", exclude_none=True),
+        )
+        logger.info(
+            "intent_ingest_rejected receipt_id=%s trace_id=%s idempotency_key=%s status=rejected",
+            intent_id,
+            trace_id,
+            idempotency_key,
         )
         return response_payload
 
