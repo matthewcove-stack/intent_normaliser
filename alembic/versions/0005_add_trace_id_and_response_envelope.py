@@ -3,7 +3,7 @@ from __future__ import annotations
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0005_add_trace_id_response_envelope"
+revision = "0005_trace_id_envelope"
 down_revision = "0004_add_actor_id_intents"
 branch_labels = None
 depends_on = None
