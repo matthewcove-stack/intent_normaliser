@@ -15,3 +15,23 @@ Implement execution + idempotency for the vertical slice:
 - Robust retry + dead-letter flows
 - Clarification UX (UI)
 - Broader action types (calendar, CRM, knowledge capture)
+
+---
+
+## MVP to Market alignment
+
+See `brain_os/docs/mvp_to_market.md`.
+
+### Phase 1 (vertical slice hardening)
+- Compatibility with voice client endpoint + auth
+- Canonical response envelope for UI confirmation
+- Clarification loop usable end-to-end
+
+### Phase 2 (broader actions)
+Add action types:
+- `notion.list.add_item`
+- `notion.note.capture`
+- (optional) `notion.db.rows.create`
+
+### Phase 3 (launch)
+- Production-safe defaults, logging, and runbooks
