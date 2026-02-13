@@ -182,6 +182,12 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             gateway_payload = payload
             if not isinstance(gateway_payload, dict) or not gateway_payload.get("notion_page_id"):
                 raise ValueError("Missing notion_page_id for update")
+        elif action_name == "notion.list.add_item":
+            endpoint = settings.gateway_lists_add_item_path
+            gateway_payload = {"list_item": payload}
+        elif action_name == "notion.note.capture":
+            endpoint = settings.gateway_notes_capture_path
+            gateway_payload = {"note": payload}
         else:
             raise ValueError(f"Unsupported action: {action_name}")
         idempotency_key = action_packet.idempotency_key or compute_action_idempotency_key(action_name, payload)
@@ -297,6 +303,12 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 "notion_page_id": fields.get("task_id"),
                 "patch": fields.get("patch", {}),
             }
+        elif intent_type == "add_list_item":
+            action_name = "notion.list.add_item"
+            payload = fields
+        elif intent_type == "capture_note":
+            action_name = "notion.note.capture"
+            payload = fields
         else:
             action_name = "notion.tasks.create"
             payload = fields

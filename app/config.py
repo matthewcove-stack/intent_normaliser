@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     gateway_bearer_token: str | None = None
     gateway_tasks_create_path: str = "/v1/notion/tasks/create"
     gateway_tasks_update_path: str = "/v1/notion/tasks/update"
+    gateway_lists_add_item_path: str = "/v1/notion/lists/add_item"
+    gateway_notes_capture_path: str = "/v1/notion/notes/capture"
     gateway_timeout_seconds: float = 15.0
     context_api_base_url: str | None = None
     context_api_bearer_token: str | None = None

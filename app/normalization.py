@@ -210,6 +210,7 @@ def normalize_intent(
     max_inferred_fields: int = 2,
 ) -> NormalizationResult:
     intent_type = packet.get("intent_type")
+    target = packet.get("target") if isinstance(packet.get("target"), dict) else {}
     fields = packet.get("fields") or {}
     confidence = packet.get("confidence")
 
@@ -225,6 +226,82 @@ def normalize_intent(
                 message="Confidence below minimum threshold",
                 details={"confidence": confidence_value, "threshold": min_confidence_to_write},
             )
+
+    target_kind = target.get("kind")
+    target_key = target.get("key")
+    if target_kind == "list" and target_key == "shopping_list":
+        item_value = fields.get("item") or fields.get("title") or packet.get("natural_language")
+        if not isinstance(item_value, str) or not item_value.strip():
+            return NormalizationResult(
+                status="rejected",
+                error_code="VALIDATION_ERROR",
+                message="Missing required field: item",
+                details={"field": "item"},
+            )
+
+        final_canonical = {
+            "intent_type": "add_list_item",
+            "fields": {
+                "list_key": "shopping_list",
+                "item": item_value.strip(),
+                "notes": fields.get("notes"),
+            },
+            "resolution": {"inferences": []},
+        }
+        plan = [
+            {
+                "kind": "action",
+                "action": "notion.list.add_item",
+                "intent_id": packet.get("intent_id"),
+                "correlation_id": packet.get("correlation_id"),
+                "payload": final_canonical["fields"],
+            }
+        ]
+        return NormalizationResult(
+            status="ready",
+            final_canonical=final_canonical,
+            canonical_draft=final_canonical,
+            plan=plan,
+        )
+
+    if target_kind == "notes":
+        note_value = fields.get("content") or fields.get("note") or packet.get("natural_language")
+        if not isinstance(note_value, str) or not note_value.strip():
+            return NormalizationResult(
+                status="rejected",
+                error_code="VALIDATION_ERROR",
+                message="Missing required field: note content",
+                details={"field": "content"},
+            )
+
+        title_value = fields.get("title")
+        if not isinstance(title_value, str) or not title_value.strip():
+            title_value = note_value.strip()[:80]
+
+        final_canonical = {
+            "intent_type": "capture_note",
+            "fields": {
+                "title": title_value,
+                "content": note_value.strip(),
+                "tags": fields.get("tags"),
+            },
+            "resolution": {"inferences": []},
+        }
+        plan = [
+            {
+                "kind": "action",
+                "action": "notion.note.capture",
+                "intent_id": packet.get("intent_id"),
+                "correlation_id": packet.get("correlation_id"),
+                "payload": final_canonical["fields"],
+            }
+        ]
+        return NormalizationResult(
+            status="ready",
+            final_canonical=final_canonical,
+            canonical_draft=final_canonical,
+            plan=plan,
+        )
 
     if not intent_type:
         canonical_draft = {

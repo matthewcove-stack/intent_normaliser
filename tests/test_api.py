@@ -380,6 +380,50 @@ def test_update_task_ready_returns_patch_payload() -> None:
     assert action["payload"]["patch"]["status"] == "In Progress"
 
 
+def test_list_target_routes_to_list_add_item_action() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "target": {"kind": "list", "key": "shopping_list"},
+        "fields": {"item": "Milk"},
+    }
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ready"
+    action = data["plan"]["actions"][0]
+    assert action["action"] == "notion.list.add_item"
+    assert action["payload"]["list_key"] == "shopping_list"
+    assert action["payload"]["item"] == "Milk"
+
+
+def test_notes_target_routes_to_note_capture_action() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "target": {"kind": "notes"},
+        "natural_language": "Remember to call Alex about design feedback",
+        "fields": {},
+    }
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ready"
+    action = data["plan"]["actions"][0]
+    assert action["action"] == "notion.note.capture"
+    assert action["payload"]["content"] == "Remember to call Alex about design feedback"
+
+
 def test_execute_actions_happy_path_persists_artifacts(monkeypatch) -> None:
     settings = build_settings(
         execute_actions=True,
@@ -444,6 +488,48 @@ def test_execute_actions_happy_path_persists_artifacts(monkeypatch) -> None:
 
     assert action_count >= 1
     assert executed_count >= 1
+
+
+def test_execute_actions_list_item_calls_list_endpoint(monkeypatch) -> None:
+    settings = build_settings(
+        execute_actions=True,
+        gateway_base_url="http://gateway",
+        gateway_bearer_token="token",
+    )
+    responses = [
+        DummyResponse(
+            200,
+            json_data={
+                "request_id": "req-list",
+                "status": "ok",
+                "data": {"notion_page_id": "notion_list_123"},
+            },
+            text='{"status":"ok"}',
+        )
+    ]
+    calls: List[Dict[str, Any]] = []
+
+    def client_factory(*args: Any, **kwargs: Any) -> DummyClient:
+        return DummyClient(responses, calls)
+
+    monkeypatch.setattr(main.httpx, "Client", client_factory)
+
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "target": {"kind": "list", "key": "shopping_list"},
+        "fields": {"item": "Bread"},
+        "request_id": "req-list",
+    }
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "executed"
+    assert len(calls) == 1
+    assert calls[0]["url"] == "http://gateway/v1/notion/lists/add_item"
 
 
 def test_execution_idempotency_skips_gateway(monkeypatch) -> None:
