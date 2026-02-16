@@ -7,6 +7,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import httpx
 from pydantic import ValidationError
@@ -85,6 +86,14 @@ def build_error_response(
 def create_app(app_settings: Settings | None = None) -> FastAPI:
     app_settings = app_settings or default_settings
     app = FastAPI()
+    cors_origins = [origin.strip() for origin in app_settings.intent_cors_origins.split(",") if origin.strip()]
+    if cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
     app.state.settings = app_settings
     app.state.engine = create_db_engine(app_settings.database_url)

@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     version: str = "0.0.0"
     git_sha: str = "unknown"
     artifact_version: int = 1
+    intent_cors_origins: str = "http://localhost:8088,http://localhost:5173,https://voice.lambiclabs.com"
 
     model_config = SettingsConfigDict(env_prefix="", case_sensitive=False)
 
