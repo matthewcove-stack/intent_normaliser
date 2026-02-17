@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Literal, Optional
 from zoneinfo import ZoneInfo
+import re
 
 import httpx
 
@@ -89,6 +90,60 @@ _WEEKDAYS = {
     "saturday": 5,
     "sunday": 6,
 }
+
+_SHOPPING_VERBS = ("buy", "get", "pick up", "pickup", "order")
+_SHOPPING_PREFIXES = ("shopping", "add to shopping")
+_SHOPPING_KEYWORDS = ("screwfix", "toolstation", "amazon")
+_TASK_IMPERATIVE_VERBS = {
+    "call",
+    "book",
+    "fix",
+    "send",
+    "write",
+    "review",
+    "plan",
+    "check",
+    "schedule",
+    "email",
+    "message",
+    "organise",
+    "organize",
+}
+
+
+def _infer_auto_intent_type(natural_language: str) -> tuple[str, float]:
+    text = natural_language.strip()
+    lowered = text.lower()
+
+    if any(lowered.startswith(prefix) for prefix in _SHOPPING_PREFIXES):
+        return "add_list_item", 0.9
+    if any(keyword in lowered for keyword in _SHOPPING_KEYWORDS):
+        return "add_list_item", 0.9
+    if any(
+        re.search(rf"\b{re.escape(verb)}\b", lowered) is not None
+        for verb in _SHOPPING_VERBS
+    ):
+        return "add_list_item", 0.9
+
+    if "to do" in lowered or lowered.startswith("todo "):
+        return "create_task", 0.7
+    first_word = lowered.split(" ", 1)[0]
+    if first_word in _TASK_IMPERATIVE_VERBS:
+        return "create_task", 0.9
+
+    return "capture_note", 0.8
+
+
+def _intent_type_clarification() -> ClarificationPayload:
+    return ClarificationPayload(
+        question="What should I create from this capture?",
+        expected_answer_type="choice",
+        candidates=[
+            {"id": "create_task", "label": "Task"},
+            {"id": "capture_note", "label": "Note"},
+            {"id": "add_list_item", "label": "Shopping list item"},
+        ],
+    )
 
 
 def _relative_due_label(value: str) -> Optional[str]:
@@ -213,6 +268,7 @@ def normalize_intent(
     target = packet.get("target") if isinstance(packet.get("target"), dict) else {}
     fields = packet.get("fields") or {}
     confidence = packet.get("confidence")
+    natural_language = packet.get("natural_language")
 
     if confidence is not None:
         try:
@@ -278,13 +334,126 @@ def normalize_intent(
         if not isinstance(title_value, str) or not title_value.strip():
             title_value = note_value.strip()[:80]
 
+        note_fields = {
+            "title": title_value,
+            "content": note_value.strip(),
+        }
+        if fields.get("tags") is not None:
+            note_fields["tags"] = fields.get("tags")
         final_canonical = {
             "intent_type": "capture_note",
+            "fields": note_fields,
+            "resolution": {"inferences": []},
+        }
+        plan = [
+            {
+                "kind": "action",
+                "action": "notion.note.capture",
+                "intent_id": packet.get("intent_id"),
+                "correlation_id": packet.get("correlation_id"),
+                "payload": final_canonical["fields"],
+            }
+        ]
+        return NormalizationResult(
+            status="ready",
+            final_canonical=final_canonical,
+            canonical_draft=final_canonical,
+            plan=plan,
+        )
+
+    if not intent_type and not target_kind:
+        if isinstance(natural_language, str) and natural_language.strip():
+            inferred_intent_type, inferred_confidence = _infer_auto_intent_type(natural_language)
+            if inferred_confidence < min_confidence_to_write:
+                canonical_draft = {
+                    "intent_type": None,
+                    "fields": fields,
+                    "pending": {"field": "intent_type"},
+                    "inference": {"intent_type": inferred_intent_type, "confidence": inferred_confidence},
+                }
+                return NormalizationResult(
+                    status="needs_clarification",
+                    canonical_draft=canonical_draft,
+                    clarification=_intent_type_clarification(),
+                )
+            intent_type = inferred_intent_type
+            fields = dict(fields)
+            if intent_type == "add_list_item":
+                fields["item"] = fields.get("item") or natural_language.strip()
+            elif intent_type == "create_task":
+                fields["title"] = fields.get("title") or natural_language.strip()
+                fields["status"] = fields.get("status") or "Todo"
+            elif intent_type == "capture_note":
+                trimmed = natural_language.strip()
+                fields["title"] = fields.get("title") or trimmed[:80]
+                fields["content"] = fields.get("content") or trimmed
+        else:
+            canonical_draft = {
+                "intent_type": None,
+                "fields": fields,
+                "pending": {"field": "intent_type"},
+            }
+            return NormalizationResult(
+                status="needs_clarification",
+                canonical_draft=canonical_draft,
+                clarification=_intent_type_clarification(),
+            )
+
+    if intent_type == "add_list_item":
+        item_value = fields.get("item") or fields.get("title") or packet.get("natural_language")
+        if not isinstance(item_value, str) or not item_value.strip():
+            return NormalizationResult(
+                status="rejected",
+                error_code="VALIDATION_ERROR",
+                message="Missing required field: item",
+                details={"field": "item"},
+            )
+        final_canonical = {
+            "intent_type": "add_list_item",
             "fields": {
-                "title": title_value,
-                "content": note_value.strip(),
-                "tags": fields.get("tags"),
+                "list_key": "shopping_list",
+                "item": item_value.strip(),
+                "notes": fields.get("notes"),
             },
+            "resolution": {"inferences": []},
+        }
+        plan = [
+            {
+                "kind": "action",
+                "action": "notion.list.add_item",
+                "intent_id": packet.get("intent_id"),
+                "correlation_id": packet.get("correlation_id"),
+                "payload": final_canonical["fields"],
+            }
+        ]
+        return NormalizationResult(
+            status="ready",
+            final_canonical=final_canonical,
+            canonical_draft=final_canonical,
+            plan=plan,
+        )
+
+    if intent_type == "capture_note":
+        note_value = fields.get("content") or fields.get("note") or packet.get("natural_language")
+        if not isinstance(note_value, str) or not note_value.strip():
+            return NormalizationResult(
+                status="rejected",
+                error_code="VALIDATION_ERROR",
+                message="Missing required field: note content",
+                details={"field": "content"},
+            )
+        title_value = fields.get("title")
+        if not isinstance(title_value, str) or not title_value.strip():
+            title_value = note_value.strip()[:80]
+        note_fields = {
+            "title": title_value,
+            "content": note_value.strip(),
+        }
+        if fields.get("tags") is not None:
+            note_fields["tags"] = fields.get("tags")
+        final_canonical = {
+            "intent_type": "capture_note",
+            "fields": note_fields,
             "resolution": {"inferences": []},
         }
         plan = [
@@ -339,8 +508,7 @@ def normalize_intent(
                 details={"field": "title"},
             )
         canonical_fields["title"] = title
-        if "status" in fields:
-            canonical_fields["status"] = fields.get("status")
+        canonical_fields["status"] = fields.get("status") or "Todo"
         if "priority" in fields:
             canonical_fields["priority"] = fields.get("priority")
     else:

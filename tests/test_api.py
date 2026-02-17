@@ -673,3 +673,91 @@ def test_persist_first_before_normalize(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert calls == ["persist"]
+
+
+def test_auto_infers_shopping_list_item() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "natural_language": "Buy cable clips",
+        "source": "voice_intake_app",
+    }
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ready"
+    action = data["plan"]["actions"][0]
+    assert action["action"] == "notion.list.add_item"
+    assert action["payload"]["list_key"] == "shopping_list"
+    assert action["payload"]["item"] == "Buy cable clips"
+
+
+def test_auto_infers_task_with_default_todo_status() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "natural_language": "Call Bob",
+        "source": "voice_intake_app",
+    }
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ready"
+    action = data["plan"]["actions"][0]
+    assert action["action"] == "notion.tasks.create"
+    assert action["payload"]["title"] == "Call Bob"
+    assert action["payload"]["status"] == "Todo"
+
+
+def test_auto_infers_note_capture_fallback() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "natural_language": "Thought: we should change the primer workflow",
+        "source": "voice_intake_app",
+    }
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ready"
+    action = data["plan"]["actions"][0]
+    assert action["action"] == "notion.note.capture"
+    assert "Thought: we should change the primer workflow" in action["payload"]["content"]
+
+
+def test_auto_weak_confidence_returns_intent_type_clarification() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "natural_language": "to do call Bob",
+        "source": "voice_intake_app",
+    }
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "needs_clarification"
+    assert data["clarification"]["expected_answer_type"] == "choice"
+    candidate_ids = [candidate["id"] for candidate in data["clarification"]["candidates"]]
+    assert "create_task" in candidate_ids
+    assert "capture_note" in candidate_ids
+    assert "add_list_item" in candidate_ids
