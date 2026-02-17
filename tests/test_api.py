@@ -823,3 +823,87 @@ def test_phase2_status_update_returns_clarification_when_ambiguous() -> None:
     assert data["status"] == "needs_clarification"
     assert data["clarification"]["expected_answer_type"] == "choice"
     assert len(data["clarification"]["candidates"]) == 2
+
+
+def test_phase3_url_capture_routes_to_note_with_url_tag() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "natural_language": "save this https://example.com/page",
+        "source": "voice_intake_app",
+    }
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ready"
+    action = data["plan"]["actions"][0]
+    assert action["action"] == "notion.note.capture"
+    assert "url" in action["payload"]["tags"]
+    assert "https://example.com/page" in action["payload"]["content"]
+
+
+def test_phase3_text_attachment_capture_includes_metadata_and_text() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "natural_language": "organiser for nuts and bolts",
+        "fields": {
+            "attachment": {
+                "filename": "shopping.txt",
+                "mime": "text/plain",
+                "size": 128,
+                "sha256": "abc123",
+                "text": "organiser for nuts and bolts",
+            }
+        },
+        "source": "voice_intake_app",
+    }
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ready"
+    action = data["plan"]["actions"][0]
+    assert action["action"] == "notion.note.capture"
+    assert "file" in action["payload"]["tags"]
+    assert "filename: shopping.txt" in action["payload"]["content"]
+    assert "organiser for nuts and bolts" in action["payload"]["content"]
+
+
+def test_phase3_binary_attachment_capture_creates_placeholder_note() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "natural_language": "save receipt",
+        "fields": {
+            "attachment": {
+                "filename": "receipt.pdf",
+                "mime": "application/pdf",
+                "size": 4096,
+                "sha256": "def456",
+            }
+        },
+        "source": "voice_intake_app",
+    }
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ready"
+    action = data["plan"]["actions"][0]
+    assert action["action"] == "notion.note.capture"
+    assert action["payload"]["title"] == "File: receipt.pdf"
+    assert "sha256: def456" in action["payload"]["content"]

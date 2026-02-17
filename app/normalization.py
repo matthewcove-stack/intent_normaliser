@@ -190,6 +190,7 @@ _STATUS_INTENT_PATTERNS: List[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^\s*start\s+(.+?)\s*$", re.IGNORECASE), "In Progress"),
     (re.compile(r"^\s*pause\s+(.+?)\s*$", re.IGNORECASE), "Todo"),
 ]
+_URL_PATTERN = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 
 
 def _extract_status_update_command(natural_language: str) -> Optional[tuple[str, str]]:
@@ -275,6 +276,83 @@ def _normalize_task_candidates(candidates: Iterable[Dict[str, Any]], selector: s
         )
     normalized.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
     return normalized[:5]
+
+
+def _extract_urls(value: Optional[str]) -> List[str]:
+    if not isinstance(value, str):
+        return []
+    return [match.group(1).rstrip(").,;") for match in _URL_PATTERN.finditer(value)]
+
+
+def _is_attachment(value: Any) -> bool:
+    return isinstance(value, dict) and isinstance(value.get("filename"), str) and bool(value.get("filename").strip())
+
+
+def _build_note_fields_from_rich_capture(fields: Dict[str, Any], natural_language: Optional[str]) -> Optional[Dict[str, Any]]:
+    tags: List[str] = []
+    title: Optional[str] = None
+    content_parts: List[str] = []
+    urls: List[str] = []
+    field_url = fields.get("url")
+    if isinstance(field_url, str) and field_url.strip():
+        urls.append(field_url.strip())
+    field_urls = fields.get("urls")
+    if isinstance(field_urls, list):
+        urls.extend([value.strip() for value in field_urls if isinstance(value, str) and value.strip()])
+    urls.extend(_extract_urls(natural_language))
+    dedup_urls = list(dict.fromkeys(urls))
+    if dedup_urls:
+        tags.append("url")
+        title = fields.get("title") if isinstance(fields.get("title"), str) else None
+        if not title:
+            title = f"URL: {dedup_urls[0][:72]}"
+        content_parts.append("URLs:")
+        for value in dedup_urls:
+            content_parts.append(f"- {value}")
+        comment = fields.get("url_comment")
+        if isinstance(comment, str) and comment.strip():
+            content_parts.append("")
+            content_parts.append("Comment:")
+            content_parts.append(comment.strip())
+
+    attachment = fields.get("attachment")
+    if _is_attachment(attachment):
+        attachment_payload = dict(attachment)
+        tags.append("file")
+        filename = str(attachment_payload.get("filename")).strip()
+        mime = str(attachment_payload.get("mime") or "application/octet-stream")
+        size = attachment_payload.get("size")
+        sha256 = str(attachment_payload.get("sha256") or "")
+        if not title:
+            title = f"File: {filename}"
+        content_parts.append("File Metadata:")
+        content_parts.append(f"- filename: {filename}")
+        content_parts.append(f"- mime: {mime}")
+        if size is not None:
+            content_parts.append(f"- size: {size}")
+        if sha256:
+            content_parts.append(f"- sha256: {sha256}")
+        extracted_text = attachment_payload.get("text")
+        if isinstance(extracted_text, str) and extracted_text.strip():
+            content_parts.append("")
+            content_parts.append("Extracted Text:")
+            content_parts.append("```text")
+            content_parts.append(extracted_text.strip())
+            content_parts.append("```")
+
+    if not content_parts:
+        return None
+    if not title:
+        if isinstance(natural_language, str) and natural_language.strip():
+            title = natural_language.strip()[:80]
+        else:
+            title = "Captured note"
+    return {
+        "title": title,
+        "content": "\n".join(content_parts).strip(),
+        "tags": list(dict.fromkeys(tags)),
+        "url": dedup_urls[0] if dedup_urls else None,
+    }
 
 
 def _infer_auto_intent_type(natural_language: str) -> tuple[str, float]:
@@ -456,6 +534,13 @@ def normalize_intent(
 
     target_kind = target.get("kind")
     target_key = target.get("key")
+
+    if not intent_type and target_kind not in {"list", "notes"}:
+        rich_capture_fields = _build_note_fields_from_rich_capture(fields, natural_language)
+        if rich_capture_fields:
+            intent_type = "capture_note"
+            fields = {**fields, **{key: value for key, value in rich_capture_fields.items() if value is not None}}
+
     if target_kind == "list" and target_key == "shopping_list":
         item_value = fields.get("item") or fields.get("title") or packet.get("natural_language")
         if not isinstance(item_value, str) or not item_value.strip():
@@ -511,6 +596,8 @@ def normalize_intent(
         }
         if fields.get("tags") is not None:
             note_fields["tags"] = fields.get("tags")
+        if fields.get("url") is not None:
+            note_fields["url"] = fields.get("url")
         final_canonical = {
             "intent_type": "capture_note",
             "fields": note_fields,
@@ -664,6 +751,8 @@ def normalize_intent(
         }
         if fields.get("tags") is not None:
             note_fields["tags"] = fields.get("tags")
+        if fields.get("url") is not None:
+            note_fields["url"] = fields.get("url")
         final_canonical = {
             "intent_type": "capture_note",
             "fields": note_fields,
