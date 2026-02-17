@@ -24,8 +24,11 @@ from app.models.packets import (
 )
 from app.normalization import (
     HttpProjectResolver,
+    HttpTaskResolver,
     ProjectResolver,
     StubProjectResolver,
+    StubTaskResolver,
+    TaskResolver,
     apply_clarification_answer,
     normalize_intent,
 )
@@ -98,6 +101,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
     app.state.settings = app_settings
     app.state.engine = create_db_engine(app_settings.database_url)
     app.state.project_resolver = None
+    app.state.task_resolver = None
 
     def build_project_resolver(settings: Settings) -> ProjectResolver:
         if settings.context_api_base_url:
@@ -109,7 +113,18 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             )
         return StubProjectResolver()
 
+    def build_task_resolver(settings: Settings) -> TaskResolver:
+        if settings.gateway_base_url and settings.gateway_bearer_token:
+            return HttpTaskResolver(
+                base_url=settings.gateway_base_url,
+                bearer_token=settings.gateway_bearer_token,
+                search_path=settings.gateway_notion_search_path,
+                timeout_seconds=settings.gateway_timeout_seconds,
+            )
+        return StubTaskResolver()
+
     app.state.project_resolver = build_project_resolver(app_settings)
+    app.state.task_resolver = build_task_resolver(app_settings)
 
     def get_settings() -> Settings:
         return app.state.settings
@@ -642,8 +657,11 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             packet_data,
             user_timezone=settings.user_timezone,
             resolver=app.state.project_resolver,
+            task_resolver=app.state.task_resolver,
             project_resolution_threshold=settings.project_resolution_threshold,
             project_resolution_margin=settings.project_resolution_margin,
+            task_resolution_threshold=settings.task_resolution_threshold,
+            task_resolution_margin=settings.task_resolution_margin,
             min_confidence_to_write=settings.min_confidence_to_write,
             max_inferred_fields=settings.max_inferred_fields,
         )
@@ -1107,8 +1125,11 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             updated_packet,
             user_timezone=settings.user_timezone,
             resolver=app.state.project_resolver,
+            task_resolver=app.state.task_resolver,
             project_resolution_threshold=settings.project_resolution_threshold,
             project_resolution_margin=settings.project_resolution_margin,
+            task_resolution_threshold=settings.task_resolution_threshold,
+            task_resolution_margin=settings.task_resolution_margin,
             min_confidence_to_write=settings.min_confidence_to_write,
             max_inferred_fields=settings.max_inferred_fields,
         )

@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Literal, Optional
 from zoneinfo import ZoneInfo
 import re
+import uuid
 
 import httpx
 
@@ -62,6 +63,81 @@ class HttpProjectResolver(ProjectResolver):
         return normalized
 
 
+class TaskResolver:
+    def resolve(self, query: str) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+
+class StubTaskResolver(TaskResolver):
+    def resolve(self, query: str) -> List[Dict[str, Any]]:
+        return []
+
+
+class HttpTaskResolver(TaskResolver):
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        bearer_token: Optional[str] = None,
+        search_path: str = "/v1/notion/search",
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._bearer_token = bearer_token
+        self._search_path = search_path
+        self._timeout_seconds = timeout_seconds
+
+    def resolve(self, query: str) -> List[Dict[str, Any]]:
+        url = f"{self._base_url}{self._search_path}"
+        headers = {"Content-Type": "application/json"}
+        if self._bearer_token:
+            headers["Authorization"] = f"Bearer {self._bearer_token}"
+        payload = {
+            "request_id": f"task-search:{uuid.uuid4()}",
+            "actor": "intent_normaliser",
+            "payload": {
+                "query": query,
+                "limit": 5,
+                "types": ["page"],
+            },
+        }
+        try:
+            response = httpx.post(url, json=payload, headers=headers, timeout=self._timeout_seconds)
+        except httpx.RequestError:
+            return []
+        if response.status_code != 200:
+            return []
+        try:
+            data = response.json()
+        except ValueError:
+            return []
+        body = data.get("data") if isinstance(data, dict) else None
+        results = body.get("results") if isinstance(body, dict) else []
+        if not isinstance(results, list):
+            return []
+        normalized: List[Dict[str, Any]] = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("id")
+            title = item.get("title")
+            if not isinstance(item_id, str) or not item_id.strip():
+                continue
+            if not isinstance(title, str) or not title.strip():
+                continue
+            normalized.append(
+                {
+                    "id": item_id,
+                    "title": title,
+                    "status": item.get("status"),
+                    "due": item.get("due"),
+                    "url": item.get("url"),
+                    "score": item.get("score"),
+                }
+            )
+        return normalized
+
+
 @dataclass
 class ClarificationPayload:
     question: str
@@ -109,6 +185,96 @@ _TASK_IMPERATIVE_VERBS = {
     "organise",
     "organize",
 }
+_STATUS_INTENT_PATTERNS: List[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"^\s*mark\s+(.+?)\s+done\s*$", re.IGNORECASE), "Done"),
+    (re.compile(r"^\s*start\s+(.+?)\s*$", re.IGNORECASE), "In Progress"),
+    (re.compile(r"^\s*pause\s+(.+?)\s*$", re.IGNORECASE), "Todo"),
+]
+
+
+def _extract_status_update_command(natural_language: str) -> Optional[tuple[str, str]]:
+    text = natural_language.strip()
+    for pattern, status_name in _STATUS_INTENT_PATTERNS:
+        match = pattern.match(text)
+        if not match:
+            continue
+        selector = match.group(1).strip()
+        if selector:
+            return selector, status_name
+    return None
+
+
+def _tokenize_text(value: str) -> set[str]:
+    tokens = re.findall(r"[a-z0-9]+", value.lower())
+    return {token for token in tokens if token}
+
+
+def _task_title_score(query: str, title: str) -> float:
+    query_clean = query.strip().lower()
+    title_clean = title.strip().lower()
+    if not query_clean or not title_clean:
+        return 0.0
+    if query_clean == title_clean:
+        return 0.99
+    if title_clean.startswith(query_clean):
+        return 0.96
+    if query_clean in title_clean:
+        return 0.92
+    query_tokens = _tokenize_text(query_clean)
+    title_tokens = _tokenize_text(title_clean)
+    if not query_tokens:
+        return 0.0
+    overlap = len(query_tokens.intersection(title_tokens)) / len(query_tokens)
+    if overlap >= 0.8:
+        return 0.90
+    if overlap >= 0.6:
+        return 0.85
+    if overlap >= 0.4:
+        return 0.78
+    return 0.60
+
+
+def _normalize_task_candidates(candidates: Iterable[Dict[str, Any]], selector: str) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        task_id = candidate.get("id") or candidate.get("page_id")
+        title = candidate.get("title") or candidate.get("label") or candidate.get("name")
+        if not isinstance(task_id, str) or not task_id.strip():
+            continue
+        if not isinstance(title, str) or not title.strip():
+            continue
+        score_raw = candidate.get("score")
+        if score_raw is None and candidate.get("confidence") is not None:
+            score_raw = candidate.get("confidence")
+        if score_raw is None:
+            score = _task_title_score(selector, title)
+        else:
+            try:
+                score = float(score_raw)
+            except (TypeError, ValueError):
+                score = _task_title_score(selector, title)
+        meta: Dict[str, Any] = {"score": score}
+        status_value = candidate.get("status")
+        due_value = candidate.get("due")
+        url_value = candidate.get("url")
+        if status_value is not None:
+            meta["status"] = status_value
+        if due_value is not None:
+            meta["due"] = due_value
+        if url_value is not None:
+            meta["url"] = url_value
+        normalized.append(
+            {
+                "id": task_id,
+                "label": title,
+                "score": score,
+                "meta": meta,
+            }
+        )
+    normalized.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return normalized[:5]
 
 
 def _infer_auto_intent_type(natural_language: str) -> tuple[str, float]:
@@ -259,11 +425,16 @@ def normalize_intent(
     *,
     user_timezone: str,
     resolver: ProjectResolver,
+    task_resolver: Optional[TaskResolver] = None,
     project_resolution_threshold: float = 0.90,
     project_resolution_margin: float = 0.10,
+    task_resolution_threshold: float = 0.90,
+    task_resolution_margin: float = 0.10,
     min_confidence_to_write: float = 0.75,
     max_inferred_fields: int = 2,
 ) -> NormalizationResult:
+    if task_resolver is None:
+        task_resolver = StubTaskResolver()
     intent_type = packet.get("intent_type")
     target = packet.get("target") if isinstance(packet.get("target"), dict) else {}
     fields = packet.get("fields") or {}
@@ -363,30 +534,72 @@ def normalize_intent(
 
     if not intent_type and not target_kind:
         if isinstance(natural_language, str) and natural_language.strip():
-            inferred_intent_type, inferred_confidence = _infer_auto_intent_type(natural_language)
-            if inferred_confidence < min_confidence_to_write:
-                canonical_draft = {
-                    "intent_type": None,
-                    "fields": fields,
-                    "pending": {"field": "intent_type"},
-                    "inference": {"intent_type": inferred_intent_type, "confidence": inferred_confidence},
-                }
-                return NormalizationResult(
-                    status="needs_clarification",
-                    canonical_draft=canonical_draft,
-                    clarification=_intent_type_clarification(),
-                )
-            intent_type = inferred_intent_type
+            status_update = _extract_status_update_command(natural_language)
             fields = dict(fields)
-            if intent_type == "add_list_item":
-                fields["item"] = fields.get("item") or natural_language.strip()
-            elif intent_type == "create_task":
-                fields["title"] = fields.get("title") or natural_language.strip()
-                fields["status"] = fields.get("status") or "Todo"
-            elif intent_type == "capture_note":
-                trimmed = natural_language.strip()
-                fields["title"] = fields.get("title") or trimmed[:80]
-                fields["content"] = fields.get("content") or trimmed
+            if status_update:
+                selector, desired_status = status_update
+                candidates = _normalize_task_candidates(task_resolver.resolve(selector), selector)
+                resolved = _select_high_confidence_candidate(
+                    candidates,
+                    threshold=task_resolution_threshold,
+                    margin=task_resolution_margin,
+                )
+                if resolved:
+                    intent_type = "update_task"
+                    fields["task_id"] = resolved.get("id")
+                    fields["status"] = desired_status
+                else:
+                    canonical_draft = {
+                        "intent_type": "update_task",
+                        "fields": {
+                            "task_id": {"selector": selector, "value": None},
+                            "patch": {"status": desired_status},
+                        },
+                        "pending": {
+                            "field": "task_id",
+                            "selector": selector,
+                            "desired_status": desired_status,
+                        },
+                    }
+                    expected_answer_type = "choice" if candidates else "free_text"
+                    question = (
+                        f"Which task matches '{selector}'?"
+                        if candidates
+                        else f"Provide the task id or exact title for '{selector}'."
+                    )
+                    return NormalizationResult(
+                        status="needs_clarification",
+                        canonical_draft=canonical_draft,
+                        clarification=ClarificationPayload(
+                            question=question,
+                            expected_answer_type=expected_answer_type,
+                            candidates=candidates,
+                        ),
+                    )
+            else:
+                inferred_intent_type, inferred_confidence = _infer_auto_intent_type(natural_language)
+                if inferred_confidence < min_confidence_to_write:
+                    canonical_draft = {
+                        "intent_type": None,
+                        "fields": fields,
+                        "pending": {"field": "intent_type"},
+                        "inference": {"intent_type": inferred_intent_type, "confidence": inferred_confidence},
+                    }
+                    return NormalizationResult(
+                        status="needs_clarification",
+                        canonical_draft=canonical_draft,
+                        clarification=_intent_type_clarification(),
+                    )
+                intent_type = inferred_intent_type
+                if intent_type == "add_list_item":
+                    fields["item"] = fields.get("item") or natural_language.strip()
+                elif intent_type == "create_task":
+                    fields["title"] = fields.get("title") or natural_language.strip()
+                    fields["status"] = fields.get("status") or "Todo"
+                elif intent_type == "capture_note":
+                    trimmed = natural_language.strip()
+                    fields["title"] = fields.get("title") or trimmed[:80]
+                    fields["content"] = fields.get("content") or trimmed
         else:
             canonical_draft = {
                 "intent_type": None,
@@ -707,6 +920,14 @@ def apply_clarification_answer(
             fields["due"] = answer_text
         elif choice_id:
             fields["due"] = choice_id
+    elif field == "task_id":
+        if choice_id:
+            fields["task_id"] = choice_id
+        elif answer_text:
+            fields["task_id"] = answer_text
+        desired_status = pending.get("desired_status")
+        if desired_status and not fields.get("status"):
+            fields["status"] = desired_status
 
     canonical_draft.pop("pending", None)
     return canonical_draft

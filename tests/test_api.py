@@ -78,6 +78,14 @@ class DummyClient:
         return self._responses.pop(0)
 
 
+class DummyTaskResolver:
+    def __init__(self, candidates: List[Dict[str, Any]]) -> None:
+        self._candidates = candidates
+
+    def resolve(self, query: str) -> List[Dict[str, Any]]:
+        return self._candidates
+
+
 def test_auth_required() -> None:
     settings = build_settings()
     app = create_app(settings)
@@ -761,3 +769,57 @@ def test_auto_weak_confidence_returns_intent_type_clarification() -> None:
     assert "create_task" in candidate_ids
     assert "capture_note" in candidate_ids
     assert "add_list_item" in candidate_ids
+
+
+def test_phase2_status_update_resolves_task_and_builds_update_plan() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    app.state.task_resolver = DummyTaskResolver(
+        [
+            {"id": "task_abc", "title": "Kitchen skirting", "status": "Todo", "due": None, "score": 0.97},
+            {"id": "task_other", "title": "Kitchen paint", "status": "Todo", "due": None, "score": 0.51},
+        ]
+    )
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "natural_language": "start kitchen skirting",
+        "source": "voice_intake_app",
+    }
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ready"
+    action = data["plan"]["actions"][0]
+    assert action["action"] == "notion.tasks.update"
+    assert action["payload"]["notion_page_id"] == "task_abc"
+    assert action["payload"]["patch"]["status"] == "In Progress"
+
+
+def test_phase2_status_update_returns_clarification_when_ambiguous() -> None:
+    settings = build_settings()
+    app = create_app(settings)
+    app.state.task_resolver = DummyTaskResolver(
+        [
+            {"id": "task_1", "title": "Call Bob", "status": "Todo", "due": None, "score": 0.92},
+            {"id": "task_2", "title": "Call Bob about design", "status": "In Progress", "due": None, "score": 0.88},
+        ]
+    )
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "natural_language": "mark call bob done",
+        "source": "voice_intake_app",
+    }
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "needs_clarification"
+    assert data["clarification"]["expected_answer_type"] == "choice"
+    assert len(data["clarification"]["candidates"]) == 2

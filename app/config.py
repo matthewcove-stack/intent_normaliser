@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     gateway_tasks_update_path: str = "/v1/notion/tasks/update"
     gateway_lists_add_item_path: str = "/v1/notion/lists/add_item"
     gateway_notes_capture_path: str = "/v1/notion/notes/capture"
+    gateway_notion_search_path: str = "/v1/notion/search"
     gateway_timeout_seconds: float = 15.0
     context_api_base_url: str | None = None
     context_api_bearer_token: str | None = None
@@ -24,6 +25,8 @@ class Settings(BaseSettings):
     clarification_expiry_hours: int = 72
     project_resolution_threshold: float = 0.90
     project_resolution_margin: float = 0.10
+    task_resolution_threshold: float = 0.90
+    task_resolution_margin: float = 0.10
     version: str = "0.0.0"
     git_sha: str = "unknown"
     artifact_version: int = 1
