@@ -110,3 +110,10 @@ Run tests inside Docker:
 ```bash
 docker compose run --rm api pytest
 ```
+
+## Edge Dev
+- `make dev`
+- `http://intent-normaliser.localhost`
+- `docs/current_state.md` (authoritative)
+- `docs/edge_integration.md`
+

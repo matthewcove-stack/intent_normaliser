@@ -1,0 +1,6 @@
+app: intent-normaliser
+entry_service: api
+entry_port: 8000
+dev_hostnames:
+- intent-normaliser.localhost
+prod_hostnames: []

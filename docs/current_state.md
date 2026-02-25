@@ -38,3 +38,8 @@ Out of scope (Phase 2+):
 ## Verification commands
 - Unit/integration tests (Docker):
   - `docker compose run --rm api pytest`
+
+## Edge Integration
+- Entry service: `api` on `8000`
+- Dev route: `http://intent-normaliser.localhost`
+- Run with `make dev` (shared edge + compose.edge.yml).

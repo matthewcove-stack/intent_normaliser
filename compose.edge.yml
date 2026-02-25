@@ -1,0 +1,9 @@
+services:
+  api:
+    networks:
+    - default
+    - edge
+networks:
+  edge:
+    external: true
+    name: edge
