@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     context_api_base_url: str | None = None
     context_api_bearer_token: str | None = None
     context_api_project_search_path: str = "/v1/projects/search"
+    context_api_research_enabled: bool = False
+    context_api_research_pack_path: str = "/v2/research/context/pack"
+    context_api_research_topic_key: str = "general"
+    context_api_research_max_items: int = 3
+    context_api_research_recency_days: int = 30
     context_api_timeout_seconds: float = 5.0
     clarification_expiry_hours: int = 72
     project_resolution_threshold: float = 0.90

@@ -553,6 +553,77 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         except SQLAlchemyError:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unavailable")
 
+    def fetch_research_context(
+        *,
+        query: str,
+        settings: Settings,
+    ) -> Optional[Dict[str, Any]]:
+        if not settings.context_api_research_enabled:
+            return None
+        if not settings.context_api_base_url or not settings.context_api_bearer_token:
+            return None
+        query_text = query.strip()
+        if not query_text:
+            return None
+        payload: Dict[str, Any] = {
+            "query": query_text[:500],
+            "topic_key": settings.context_api_research_topic_key.strip().lower() or "general",
+            "max_items": max(settings.context_api_research_max_items, 1),
+        }
+        if settings.context_api_research_recency_days >= 0:
+            payload["recency_days"] = settings.context_api_research_recency_days
+        headers = {
+            "Authorization": f"Bearer {settings.context_api_bearer_token}",
+            "Content-Type": "application/json",
+        }
+        url = f"{settings.context_api_base_url.rstrip('/')}{settings.context_api_research_pack_path}"
+        try:
+            response = httpx.post(url, json=payload, headers=headers, timeout=settings.context_api_timeout_seconds)
+        except httpx.RequestError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        if not isinstance(body, dict):
+            return None
+        return {
+            "retrieval_confidence": body.get("retrieval_confidence"),
+            "next_action": body.get("next_action"),
+            "pack": body.get("pack") or {"items": []},
+            "trace": body.get("trace") or {},
+        }
+
+    def attach_research_context(
+        response_payload: IngestResponse,
+        *,
+        research_context: Optional[Dict[str, Any]],
+    ) -> None:
+        if not research_context:
+            return
+        details = dict(response_payload.details or {})
+        details["research_context"] = research_context
+        response_payload.details = details
+
+    def derive_research_query(
+        *,
+        packet_data: Dict[str, Any],
+        final_canonical: Dict[str, Any],
+    ) -> str:
+        natural = packet_data.get("natural_language")
+        if isinstance(natural, str) and natural.strip():
+            return natural.strip()
+        fields = final_canonical.get("fields") if isinstance(final_canonical, dict) else {}
+        if not isinstance(fields, dict):
+            return ""
+        for key in ("content", "title", "item"):
+            value = fields.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
         intent_id = intent_row["intent_id"]
         correlation_id = intent_row["correlation_id"]
         trace_id = intent_row.get("trace_id") or trace_id
@@ -719,12 +790,13 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             return response_payload
 
         if result.status == "ready":
+            final_canonical = result.final_canonical or {}
             intent_row = update_intent(
                 app.state.engine,
                 intent_id=intent_id,
                 status="ready",
                 canonical_draft=result.canonical_draft or {},
-                final_canonical=result.final_canonical or {},
+                final_canonical=final_canonical,
             )
             plan = build_plan(intent_id, correlation_id, intent_row.get("final_canonical") or {})
             response_payload = IngestResponse(
@@ -733,6 +805,9 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 correlation_id=correlation_id,
                 plan=plan,
             )
+            research_query = derive_research_query(packet_data=packet_data, final_canonical=final_canonical)
+            research_context = fetch_research_context(query=research_query, settings=settings)
+            attach_research_context(response_payload, research_context=research_context)
             if settings.execute_actions:
                 try:
                     all_success, execution_results = execute_plan(
@@ -758,6 +833,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         ),
                     )
+                    attach_research_context(response_payload, research_context=research_context)
                     attach_request_id(response_payload, request_id)
                     attach_receipt_fields(
                         response_payload,
@@ -821,6 +897,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                             details=error_details,
                         ),
                     )
+                    attach_research_context(response_payload, research_context=research_context)
                     attach_request_id(response_payload, request_id)
                     attach_receipt_fields(
                         response_payload,
@@ -864,6 +941,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                     "notion_task_id": notion_task_id,
                     "request_id": request_id,
                 }
+                attach_research_context(response_payload, research_context=research_context)
                 attach_receipt_fields(
                     response_payload,
                     intent_id=intent_id,
@@ -898,6 +976,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                     "status": "ready",
                     "final_canonical": intent_row.get("final_canonical"),
                     "plan": response_payload.plan.model_dump(mode="json"),
+                    "research_context": research_context,
                 },
                 kind="intent",
                 intent_type=packet.intent_type,
@@ -1177,12 +1256,13 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             return response_payload
 
         if result.status == "ready":
+            final_canonical = result.final_canonical or {}
             intent_row = update_intent(
                 app.state.engine,
                 intent_id=intent_row["intent_id"],
                 status="ready",
                 canonical_draft=result.canonical_draft or updated_packet,
-                final_canonical=result.final_canonical or {},
+                final_canonical=final_canonical,
             )
             plan = build_plan(intent_row["intent_id"], intent_row["correlation_id"], intent_row.get("final_canonical") or {})
             response_payload = IngestResponse(
@@ -1191,11 +1271,15 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                 correlation_id=intent_row["correlation_id"],
                 plan=plan,
             )
+            research_query = derive_research_query(packet_data=updated_packet, final_canonical=final_canonical)
+            research_context = fetch_research_context(query=research_query, settings=settings)
+            attach_research_context(response_payload, research_context=research_context)
             persist_artifact(
                 packet={
                     "status": "ready",
                     "final_canonical": intent_row.get("final_canonical"),
                     "plan": response_payload.plan.model_dump(mode="json"),
+                    "research_context": research_context,
                 },
                 kind="intent",
                 intent_type=None,

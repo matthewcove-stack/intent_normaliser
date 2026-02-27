@@ -37,6 +37,11 @@ Optional:
 - `CONTEXT_API_BASE_URL` (default: unset, use a Docker service name when running inside containers)
 - `CONTEXT_API_BEARER_TOKEN` (default: unset)
 - `CONTEXT_API_PROJECT_SEARCH_PATH` (default: /v1/projects/search)
+- `CONTEXT_API_RESEARCH_ENABLED` (default: false)
+- `CONTEXT_API_RESEARCH_PACK_PATH` (default: /v2/research/context/pack)
+- `CONTEXT_API_RESEARCH_TOPIC_KEY` (default: general)
+- `CONTEXT_API_RESEARCH_MAX_ITEMS` (default: 3)
+- `CONTEXT_API_RESEARCH_RECENCY_DAYS` (default: 30)
 - `CONTEXT_API_TIMEOUT_SECONDS` (default: 5)
 - `VERSION` (default: 0.0.0)
 - `GIT_SHA` (default: unknown)
@@ -62,6 +67,8 @@ Requires bearer auth. Writes a `received` artifact row, normalizes the intent, a
 - `rejected` with an error object (`error.code`, `error.message`, `error.details`)
 
 Additional artifacts are written for each outcome.
+
+When research enrichment is enabled (`CONTEXT_API_RESEARCH_ENABLED=true` and context API auth configured), responses also include `details.research_context` from `context_api /v2/research/context/pack`.
 
 ### GET /v1/intents/{intent_id}
 

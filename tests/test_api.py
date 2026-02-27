@@ -498,6 +498,71 @@ def test_execute_actions_happy_path_persists_artifacts(monkeypatch) -> None:
     assert executed_count >= 1
 
 
+def test_execute_actions_attaches_research_context_when_enabled(monkeypatch) -> None:
+    settings = build_settings(
+        execute_actions=True,
+        gateway_base_url="http://gateway",
+        gateway_bearer_token="token",
+        context_api_base_url="http://context-api",
+        context_api_bearer_token="ctx-token",
+        context_api_research_enabled=True,
+        context_api_research_topic_key="ai_supply",
+    )
+    responses = [
+        DummyResponse(
+            200,
+            json_data={
+                "request_id": "req-research",
+                "status": "ok",
+                "data": {"notion_page_id": "notion_research_123"},
+            },
+            text='{"status":"ok"}',
+        )
+    ]
+    calls: List[Dict[str, Any]] = []
+    research_calls: List[Dict[str, Any]] = []
+
+    def client_factory(*args: Any, **kwargs: Any) -> DummyClient:
+        return DummyClient(responses, calls)
+
+    def fake_research_post(url: str, json: Dict[str, Any], headers: Dict[str, str], timeout: float) -> DummyResponse:
+        research_calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+        return DummyResponse(
+            200,
+            json_data={
+                "pack": {"items": [{"document_id": "doc_1", "summary": "supply signal"}]},
+                "retrieval_confidence": "med",
+                "next_action": "proceed",
+                "trace": {"trace_id": "trace-research"},
+            },
+            text='{"ok":true}',
+        )
+
+    monkeypatch.setattr(main.httpx, "Client", client_factory)
+    monkeypatch.setattr(main.httpx, "post", fake_research_post)
+
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.intent_service_token}"}
+    payload = {
+        "kind": "intent",
+        "intent_type": "create_task",
+        "natural_language": "research the latest gpu packaging supply signals",
+        "fields": {"title": "Review packaging supply"},
+        "request_id": "req-research",
+    }
+
+    response = client.post("/v1/intents", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "executed"
+    assert data["details"]["research_context"]["trace"]["trace_id"] == "trace-research"
+    assert len(research_calls) == 1
+    assert research_calls[0]["url"] == "http://context-api/v2/research/context/pack"
+    assert research_calls[0]["json"]["topic_key"] == "ai_supply"
+
+
 def test_execute_actions_list_item_calls_list_endpoint(monkeypatch) -> None:
     settings = build_settings(
         execute_actions=True,
