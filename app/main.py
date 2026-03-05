@@ -315,6 +315,15 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
                     settings=settings,
                 )
 
+                if success and action_name == "notion.tasks.create" and notion_task_id:
+                    task_payload = request_envelope.get("payload", {}).get("task") or {}
+                    push_task_sync(
+                        task_id=notion_task_id,
+                        title=str(task_payload.get("title", "")),
+                        status=task_payload.get("status"),
+                        settings=settings,
+                    )
+
         all_success = all(item["success"] for item in results)
         return all_success, results
 
@@ -552,6 +561,24 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             )
         except SQLAlchemyError:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unavailable")
+
+    def push_task_sync(task_id: str, title: str, status: Optional[str], settings: Settings) -> None:
+        """Best-effort: push a newly created task to context_api task mirror. Swallows all errors."""
+        if not settings.context_api_base_url or not settings.context_api_bearer_token:
+            return
+        url = f"{settings.context_api_base_url.rstrip('/')}/v1/tasks/sync"
+        payload: Dict[str, Any] = {
+            "source": "notion_gateway",
+            "items": [{"task_id": task_id, "title": title, "status": status}],
+        }
+        headers = {
+            "Authorization": f"Bearer {settings.context_api_bearer_token}",
+            "Content-Type": "application/json",
+        }
+        try:
+            httpx.post(url, json=payload, headers=headers, timeout=settings.context_api_timeout_seconds)
+        except Exception:
+            logger.warning("context_api task sync skipped for task_id=%s", task_id)
 
     def fetch_research_context(
         *,
